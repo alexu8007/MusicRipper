@@ -88,7 +88,7 @@ class SpotifyDownloader:
         query_parts.append("Audio") # Consistently add "Audio" at the end
         search_query_base = " ".join(part for part in query_parts if part and part.strip()) # Join non-empty, non-whitespace-only parts
         
-        sanitized_track_name = sanitize_filename(f"{original_artist} - {original_name}")
+        sanitized_track_name = sanitize_filename(f"{original_name} {original_artist}")
         ensure_dir_exists(attempt_temp_folder) # For individual raw downloads
 
         logger.info(f"Searching top {MAX_SEARCH_RESULTS_PER_SOURCE} results on {source_name} for: {search_query_base}")

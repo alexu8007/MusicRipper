@@ -1,6 +1,7 @@
-rich
-spotipy
-yt-dlp
-pydub
-python-dotenv
-requests 
+Pillow==11.2.1
+pydub==0.25.1
+python-dotenv==1.1.0
+Requests==2.32.3
+rich==14.0.0
+spotipy==2.25.1
+yt_dlp==2025.4.30
