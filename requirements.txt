@@ -1,0 +1,6 @@
+rich
+spotipy
+yt-dlp
+pydub
+python-dotenv
+requests 
