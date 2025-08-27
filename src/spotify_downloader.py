@@ -7,7 +7,14 @@ logger = logging.getLogger(__name__)
 
 
 def _is_exception_type_tuple(obj: Any) -> bool:
-    """Return True if obj is a tuple of Exception types."""
+    """
+    Return True if obj is a tuple containing only exception types.
+    
+    Checks that obj is a tuple and that every element is a class subclassing BaseException.
+    
+    Returns:
+        bool: True if obj is a tuple of exception types, otherwise False.
+    """
     if not isinstance(obj, tuple):
         return False
     return all(isinstance(t, type) and issubclass(t, BaseException) for t in obj)
@@ -15,8 +22,16 @@ def _is_exception_type_tuple(obj: Any) -> bool:
 
 def _sanitize_param_value(key: str, value: Any) -> Any:
     """
-    Redact values for keys that look sensitive.
-    This function intentionally opts for conservative redaction to avoid leaking secrets.
+    Return a sanitized value for logging: redact sensitive keys and truncate long strings.
+    
+    This function inspects the parameter name `key` (must be a str) for common sensitive indicators
+    (e.g. "password", "token", "api_key", "auth", "secret", "credential"). If any indicator is
+    present in `key` (case-insensitive), the function returns the literal "<REDACTED>".
+    If `key` is not a string, the original `value` is returned unchanged.
+    
+    For non-redacted string values longer than 200 characters, the function returns a truncated
+    version (first 200 characters) with the suffix "...<truncated>" to avoid log flooding.
+    All other values are returned unchanged.
     """
     if not isinstance(key, str):
         return value
@@ -33,8 +48,14 @@ def _sanitize_param_value(key: str, value: Any) -> Any:
 
 def _sanitize_params(params: Optional[Union[Dict[str, Any], Sequence[Any]]]) -> Any:
     """
-    Produce a sanitized copy of params suitable for logging.
-    If params is a mapping, redact sensitive keys. If it's a sequence, represent items safely.
+    Return a sanitized representation of `params` suitable for logging.
+    
+    If `params` is None, returns None. If it's a dict, returns a new dict with values redacted or truncated for sensitive keys via _sanitize_param_value. If it's a list or tuple, returns a sequence of the same type where:
+    - dict elements are recursively sanitized,
+    - strings longer than 200 characters are truncated to 200 characters and appended with "...<truncated>",
+    - other elements are kept as-is.
+    
+    For any other input types, returns the original value unchanged (caller is responsible for not logging secrets).
     """
     if params is None:
         return None
@@ -67,24 +88,33 @@ def call_with_handling(
     sanitize_context_keys: bool = True,
 ) -> Any:
     """
-    Call func(*args) and handle expected exceptions explicitly.
-
+    Invoke func(*args) and handle specified exceptions with sanitized, structured logging.
+    
+    If any exception whose type is listed in `exceptions` is raised, this function logs a sanitized record
+    containing the function name, sanitized positional arguments, and an optionally sanitized `context`.
+    When an expected exception is caught the function either returns `fallback` (default) or re-raises
+    the original exception if `reraise` is True.
+    
     Parameters:
-    - func: callable to invoke.
-    - args: positional arguments passed to func.
-    - exceptions: exception type or tuple of exception types to catch. Defaults to Exception.
-                  Provide precise expected exceptions where possible.
-    - fallback: value to return if an expected exception is caught and reraise is False.
-    - reraise: if True, re-raise the caught exception after logging; otherwise return fallback.
-    - logger_to_use: optional logger; if None the module-level logger is used.
-    - context: optional dict of context information to include in logs (will be sanitized).
-    - sanitize_context_keys: whether to sanitize/redact sensitive keys in context.
-
-    Behavior:
-    - Only exceptions matching 'exceptions' are caught; others propagate.
-    - Caught exceptions are logged with structured context and sanitized parameters.
-    - When reraise is True, the original exception is re-raised to preserve semantics.
-    - When reraise is False, fallback is returned (preserves previous silent-failure fallback).
+        func (Callable[..., Any]): The callable to invoke.
+        *args (Any): Positional arguments forwarded to `func`.
+        exceptions (Optional[Union[Type[BaseException], Tuple[Type[BaseException], ...]]]): Exception
+            type or tuple of exception types to catch. If None, no exceptions are caught. Defaults to
+            `Exception`.
+        fallback (Any): Value returned when an expected exception is caught and `reraise` is False.
+        reraise (bool): If True, re-raise the caught exception after logging; otherwise return `fallback`.
+        context (Optional[Dict[str, Any]]): Optional context dictionary included in the log; when
+            `sanitize_context_keys` is True and `context` is a dict, keys and values will be sanitized to
+            avoid exposing secrets.
+        sanitize_context_keys (bool): Whether to sanitize/redact potentially sensitive keys in `context`.
+    
+    Returns:
+        Any: The result of `func(*args)` if no expected exception is raised, otherwise `fallback` (unless
+        `reraise` is True).
+    
+    Raises:
+        TypeError: If `exceptions` is not an exception type, a tuple of exception types, or None.
+        Exception: Re-raises any caught exception when `reraise` is True (preserves the original exception).
     """
     chosen_logger = logger_to_use or logger
 
@@ -145,25 +175,38 @@ def safe_call(
     context_provider: Optional[Callable[..., Optional[Dict[str, Any]]]] = None,
 ):
     """
-    Decorator to wrap a function call with explicit exception handling.
-
-    Example:
-    @safe_call(exceptions=(KeyError, ValueError), fallback=None, reraise=False)
-    def myfunc(...):
-        ...
-
-    The decorator will catch only the specified exceptions, log a warning with sanitized inputs,
-    and either return the fallback or re-raise depending on reraise.
-
+    Return a decorator that wraps a callable with controlled exception handling and optional enriched context for logs.
+    
+    The returned decorator wraps the target function so that when it is called:
+    - Exceptions matching `exceptions` are intercepted and handled by `call_with_handling`.
+    - On a matched exception, the wrapper either returns `fallback` or re-raises depending on `reraise`.
+    - If provided, `context_provider(*args, **kwargs)` is called to produce contextual information included in the log context; failures in the context provider are ignored and do not prevent the wrapped call.
+    - If keyword arguments are present when the wrapped function is invoked, their keys are added to the log context under "kwargs_keys" (values are not included here; `call_with_handling` will sanitize values if needed).
+    
     Parameters:
-    - exceptions: exception type or tuple to catch.
-    - fallback: value to return on caught exception when reraise is False.
-    - reraise: whether to re-raise the exception after logging.
-    - logger_to_use: optional logger instance to use for logging.
-    - context_provider: optional callable that receives the same args/kwargs and returns a dict
-                        of contextual information to include in logs (should avoid secrets).
+        exceptions: Exception type or tuple of exception types to catch; defaults to `Exception`.
+        fallback: Value to return when a specified exception is caught and `reraise` is False.
+        reraise: If True, re-raise caught exceptions after logging; otherwise suppress and return `fallback`.
+        context_provider: Optional callable called as `context_provider(*args, **kwargs)` to supply extra context (should return a dict or any value). Exceptions raised by this callable are ignored.
+    
+    Returns:
+        A decorator that can be applied to a function to provide the described safe call behavior.
     """
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        """
+        Wrap the given function so it is executed via call_with_handling with optional contextual enrichment.
+        
+        The returned wrapper:
+        - Attempts to obtain additional context by calling `context_provider(*args, **kwargs)` if a provider was supplied; if the provider raises, the error is logged at DEBUG and execution proceeds without it.
+        - Builds a combined context that merges the provider result (if any) — if the provider returns a non-dict value it is stored under the key `"context"` — and, if keyword arguments were passed, a `"kwargs_keys"` entry listing their keys.
+        - Invokes `call_with_handling` to execute the original function with the configured `exceptions`, `fallback`, `reraise`, and `logger_to_use` behavior, ensuring arguments and context are sanitized in logs.
+        
+        Parameters:
+            func: The callable to wrap.
+        
+        Returns:
+            A callable with the same signature as `func` that applies the configured safe execution and logging behavior.
+        """
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             ctx = None

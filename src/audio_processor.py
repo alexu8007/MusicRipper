@@ -30,7 +30,17 @@ def _ensure_output_directory(output_path: str) -> None:
 
 
 def _build_tags(artist: str, title: str, album: Optional[str], track_number: Optional[str], year: Optional[str]) -> Dict[str, str]:
-    """Build the export tags dictionary for pydub/ffmpeg export."""
+    """
+    Build ID3/FFmpeg tag dictionary for exporting audio.
+    
+    Artist and title are always included. Optional fields are added when provided:
+    - album -> "album"
+    - track_number -> "tracknumber" (FFmpeg expects 'tracknumber')
+    - year -> "date" (FFmpeg expects 'date')
+    
+    Returns:
+        dict: Mapping of tag names to string values suitable for passing as `tags` to pydub/ffmpeg export.
+    """
     tags: Dict[str, str] = {"artist": artist, "title": title}
     if album:
         tags["album"] = album
@@ -42,7 +52,18 @@ def _build_tags(artist: str, title: str, album: Optional[str], track_number: Opt
 
 
 def _prepare_export_params(tags: Dict[str, str], cover_image_path: Optional[str]) -> Dict[str, Any]:
-    """Prepare the parameters dict passed to AudioSegment.export, embedding cover art if available."""
+    """
+    Prepare the parameter dictionary for AudioSegment.export, including format, bitrate, tags, and optional cover art.
+    
+    If cover_image_path is provided and the file exists, the returned dict will include a "cover" key pointing to that path; if the path is provided but missing, cover art is omitted.
+    
+    Parameters:
+        tags (Dict[str, str]): ID3-style tags to attach to the exported file (must include at least artist/title).
+        cover_image_path (Optional[str]): Path to an image file to embed as cover art. If None or the file does not exist, no cover is embedded.
+    
+    Returns:
+        Dict[str, Any]: Parameters suitable for passing to AudioSegment.export (keys include "format", "bitrate", "tags", and optionally "cover").
+    """
     export_params: Dict[str, Any] = {
         "format": DEFAULT_AUDIO_FORMAT,
         "bitrate": DEFAULT_AUDIO_BITRATE,
@@ -58,7 +79,14 @@ def _prepare_export_params(tags: Dict[str, str], cover_image_path: Optional[str]
 
 
 def _remove_partial_file(path: str) -> None:
-    """Attempt to remove a partially created file; log if removal fails."""
+    """
+    Remove a partially written file at the given path if it exists, suppressing exceptions.
+    
+    This is a best-effort cleanup: if the file at `path` exists the function attempts to unlink it and logs an error on failure but does not raise.
+    
+    Parameters:
+        path (str): Filesystem path to the file to remove.
+    """
     if os.path.exists(path):
         try:
             os.remove(path)
@@ -68,8 +96,11 @@ def _remove_partial_file(path: str) -> None:
 
 def _get_mediainfo_safe(file_path: str) -> Optional[Dict[str, Any]]:
     """
-    Safely retrieve mediainfo for a file. Returns None on unrecoverable errors.
-    This avoids raising on common filesystem/ffprobe issues and centralizes handling.
+    Safely obtain mediainfo metadata for a file, returning a dict on success or None on failure.
+    
+    This function calls pydub.utils.mediainfo(file_path) and normalizes failure modes so callers do not need to handle common filesystem or probing errors. If mediainfo returns a non-dict result or if an OSError/ValueError/other exception occurs, the function logs the problem and returns None instead of raising.
+    Returns:
+        Optional[Dict[str, Any]]: Parsed mediainfo dictionary on success, otherwise None.
     """
     try:
         info = mediainfo(file_path)
@@ -93,7 +124,17 @@ def _is_format_mp3(info: Dict[str, Any]) -> bool:
 
 
 def _is_approx_320kbps(info: Dict[str, Any]) -> bool:
-    """Check whether the bitrate is approximately 320kbps allowing small tolerances."""
+    """
+    Return True if the given mediainfo dict indicates a bitrate of approximately 320 kbps.
+    
+    Expects a mediainfo-like mapping that may contain the keys "bit_rate" or "bitrate" whose value is an integer or numeric string denoting bitrate in bits per second. Values between 315000 and 325000 (±5 kbps around 320000 bps) are considered approximately 320 kbps. If the bitrate cannot be parsed, the function returns False.
+        
+    Parameters:
+        info (Dict[str, Any]): Mediainfo dictionary (from pydub.utils.mediainfo) containing bitrate fields.
+    
+    Returns:
+        bool: True when bitrate is within the 315000–325000 bps range, otherwise False.
+    """
     bit_rate_str = info.get("bit_rate") or info.get("bitrate") or "0"
     try:
         bit_rate = int(bit_rate_str)
@@ -106,8 +147,15 @@ def _is_approx_320kbps(info: Dict[str, Any]) -> bool:
 
 def _get_duration_ms_from_info(info: Dict[str, Any]) -> Optional[int]:
     """
-    Attempt to extract duration in milliseconds from mediainfo.
-    Prefers 'duration' (seconds) and 'duration_ms' (if available).
+    Extract duration from mediainfo and return it in milliseconds.
+    
+    This function looks for "duration_ms" or "duration" keys in the provided mediainfo-like dict and attempts to normalize the value to an integer number of milliseconds. Accepted input forms include:
+    - numeric milliseconds (int/float > 1000),
+    - numeric seconds (int/float < 1000; interpreted as seconds and converted to ms),
+    - string representations of seconds or milliseconds (e.g., "3.5", "3500").
+    
+    Returns:
+        int | None: Duration in milliseconds on successful parse, otherwise None if the value is missing or cannot be parsed.
     """
     duration_ms = None
     # Some mediainfo returns 'duration' in seconds as a string, sometimes with decimals.
@@ -138,22 +186,13 @@ def convert_to_mp3_320kbps(input_path: str, output_path: str,
                            year: str | None = None, 
                            cover_image_path: str | None = None) -> bool:
     """
-    Converts an audio file to MP3 format at 320kbps.
-    Adds ID3 tags for artist, title, album, track number, year, and cover art.
-
-    Args:
-        input_path: Path to the input audio file.
-        output_path: Path to save the converted MP3 file.
-        artist: Song artist for ID3 tag.
-        title: Song title for ID3 tag.
-        album: Album name for ID3 tag.
-        track_number: Track number for ID3 tag.
-        year: Release year for ID3 tag.
-        cover_image_path: Path to the cover image file.
-
-    Returns:
-        True if conversion was successful, False otherwise.
-    """
+                           Convert an input audio file to MP3 at ~320 kbps, embedding ID3 tags and optional cover art.
+                           
+                           Attempts to load the input via pydub, ensures the output directory exists, and exports an MP3 file using the module's default format and bitrate. Optional metadata (artist, title, album, track number, year) is written into the file; a provided cover_image_path will be embedded only if the file exists. On export failure the function will remove any partially written output file.
+                           
+                           Returns:
+                               bool: True if conversion and export completed successfully; False on any read, encode, or unexpected error (no file written or partial files cleaned up).
+                           """
     try:
         logger.info(f"Attempting to convert {input_path} to MP3 320kbps with extended metadata.")
         # Load input audio - pydub will use ffmpeg/avlib under the hood; this step can raise decode errors.
@@ -193,21 +232,17 @@ def convert_to_mp3_320kbps(input_path: str, output_path: str,
 
 def validate_mp3_320kbps(file_path: str, expected_duration_ms: int | None = None, duration_tolerance_ms: int = DEFAULT_DURATION_TOLERANCE_MS) -> bool:
     """
-    Validates if a file is an MP3, has a bitrate of approximately 320kbps,
-    and optionally matches an expected duration within a tolerance.
-
-    This function attempts to use mediainfo for format, bitrate, and duration
-    checks to avoid loading the entire audio file into memory. If mediainfo
-    lacks duration information and a duration check is requested, it will fall
-    back to loading the audio via pydub as a last resort.
-
-    Args:
-        file_path: Path to the audio file.
-        expected_duration_ms: Expected duration of the audio in milliseconds.
-        duration_tolerance_ms: Tolerance for the duration check in milliseconds.
-
+    Validate that a file is an MP3 encoded at approximately 320 kbps and, optionally, that its duration matches an expected value within a tolerance.
+    
+    Performs non-destructive checks using mediainfo for format, bitrate, and (preferably) duration. If mediainfo does not provide a reliable duration and a duration check is requested, the function falls back to loading the file with pydub to compute duration. Duration comparison uses a symmetric tolerance in milliseconds.
+    
+    Parameters:
+        file_path (str): Path to the file to validate.
+        expected_duration_ms (int | None): If provided, the expected duration in milliseconds; when None no duration check is performed.
+        duration_tolerance_ms (int): Allowed deviation (±) in milliseconds for the duration check (default: DEFAULT_DURATION_TOLERANCE_MS).
+    
     Returns:
-        True if validation passes, False otherwise.
+        bool: True if the file is MP3, has an approximate 320 kbps bitrate, and (when requested) its duration falls within the specified tolerance; otherwise False.
     """
     if not os.path.exists(file_path):
         logger.warning(f"Validation failed: File {file_path} does not exist.")

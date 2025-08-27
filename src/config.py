@@ -35,11 +35,10 @@ CONFIG_DOCS: Dict[str, str] = {
 
 def _ensure_str(value: Any, name: str) -> str:
     """
-    Ensure the provided value is a string. Raises TypeError if not.
-
-    :param value: Value to check.
-    :param name: Name of the configuration item (used in error messages).
-    :return: The value cast to str.
+    Validate that `value` is a non-empty string and return it.
+    
+    Raises TypeError if `value` is None or not a str. Raises ValueError if `value` is an empty string.
+    The `name` parameter is only used to produce clearer error messages identifying the configuration key.
     """
     if value is None:
         raise TypeError(f"Configuration '{name}' must be a string, not None. Set it via environment variable '{name}'.")
@@ -52,12 +51,13 @@ def _ensure_str(value: Any, name: str) -> str:
 
 def _validate_bitrate(bitrate: str) -> str:
     """
-    Validate bitrate string like '320k'. Numeric part must be an integer between 32 and 512 (kbps).
-    Returns the same bitrate string if valid.
-
-    :param bitrate: Bitrate string to validate.
-    :return: Validated bitrate string.
-    :raises ValueError: If format or numeric range is invalid.
+    Validate an audio bitrate string in the form '<number>k' and return it normalized.
+    
+    Accepts a string like '320k' or '320K'; the numeric portion must be an integer between 32 and 512 (kbps). The returned value is normalized to '<n>k' (lowercase 'k' with the parsed integer, removing any leading zeros).
+    
+    Raises:
+        TypeError: If `bitrate` is not a string.
+        ValueError: If the string does not match '<number>k' or the numeric value is outside 32–512.
     """
     if not isinstance(bitrate, str):
         raise TypeError("DEFAULT_AUDIO_BITRATE must be a string like '320k'.")
@@ -72,11 +72,20 @@ def _validate_bitrate(bitrate: str) -> str:
 
 def _validate_format(audio_format: str) -> str:
     """
-    Validate audio format against a whitelist.
-
-    :param audio_format: Format string to validate.
-    :return: Lowercased validated format.
-    :raises ValueError: If format not supported.
+    Validate and normalize an audio format string against the supported set.
+    
+    Accepts a string (case-insensitive) and returns the normalized, lowercased format.
+    Supported formats: "mp3", "wav", "flac", "aac", "ogg".
+    
+    Parameters:
+        audio_format (str): The format to validate (will be stripped and lowercased).
+    
+    Returns:
+        str: The validated, lowercased audio format.
+    
+    Raises:
+        TypeError: If `audio_format` is not a string.
+        ValueError: If `audio_format` is not one of the supported formats.
     """
     if not isinstance(audio_format, str):
         raise TypeError("DEFAULT_AUDIO_FORMAT must be a string.")
@@ -89,11 +98,20 @@ def _validate_format(audio_format: str) -> str:
 
 def _validate_log_level(level: str) -> str:
     """
-    Validate logging level string.
-
-    :param level: Logging level to validate.
-    :return: Uppercased logging level.
-    :raises ValueError: If level not one of supported values.
+    Validate and normalize a logging level name.
+    
+    Strips surrounding whitespace and returns the level uppercased if it is one of:
+    DEBUG, INFO, WARNING, ERROR, CRITICAL.
+    
+    Parameters:
+        level (str): Logging level name (any case, surrounding whitespace allowed).
+    
+    Returns:
+        str: Normalized uppercased logging level.
+    
+    Raises:
+        TypeError: If `level` is not a string.
+        ValueError: If `level` is not one of the allowed logging levels.
     """
     if not isinstance(level, str):
         raise TypeError("LOG_LEVEL must be a string.")
@@ -106,13 +124,25 @@ def _validate_log_level(level: str) -> str:
 
 def _validate_path(path: str, name: str, create_if_missing: bool = False) -> str:
     """
-    Validate filesystem path string. Optionally create the directory if missing.
-
-    :param path: Path to validate.
-    :param name: Configuration name for error messages.
-    :param create_if_missing: Create directory if it does not exist.
-    :return: Absolute path string.
-    :raises TypeError, OSError: If invalid type or creation fails.
+    Validate a filesystem path string and return its absolute path.
+    
+    Validates that `path` is a non-empty string and returns its absolute form. If
+    `create_if_missing` is True, treats the path as a directory and attempts to
+    create it (parents created as needed).
+    
+    Parameters:
+        path (str): The filesystem path to validate.
+        name (str): Configuration key name used in error messages.
+        create_if_missing (bool): If True, create the directory at the resolved
+            path when it does not exist.
+    
+    Returns:
+        str: Absolute path.
+    
+    Raises:
+        TypeError: If `path` is not a string.
+        ValueError: If `path` is an empty string.
+        OSError: If `create_if_missing` is True but the directory cannot be created.
     """
     if not isinstance(path, str):
         raise TypeError(f"{name} must be a string representing a filesystem path.")
@@ -130,12 +160,22 @@ def _validate_path(path: str, name: str, create_if_missing: bool = False) -> str
 
 def _validate_executable_path(path: str, name: str) -> str:
     """
-    Validate that an optional executable path exists on the filesystem.
-
-    :param path: Path to executable.
-    :param name: Configuration key name for error messages.
-    :return: Absolute path string.
-    :raises FileNotFoundError: If path is provided but does not exist.
+    Validate an optional filesystem path to an executable and return its absolute path.
+    
+    If `path` is None or an empty string, returns an empty string (meaning "not provided").
+    If `path` is provided, it must be a string that points to an existing file; the function
+    returns the absolute path.
+    
+    Parameters:
+        path: Optional path to the executable (may be None or "").
+        name: Configuration key name used in error messages.
+    
+    Returns:
+        The absolute path to the executable, or an empty string if not provided.
+    
+    Raises:
+        TypeError: If `path` is not a string when provided.
+        FileNotFoundError: If `path` is provided but no file exists at that location.
     """
     if path is None or path == "":
         return ""

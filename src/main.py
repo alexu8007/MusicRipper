@@ -41,16 +41,16 @@ def create_ui_elements() -> Console:
 
 def display_summary(console: Console, downloaded_songs: List[Dict[str, Any]], failed_songs: List[Dict[str, Any]], download_folder: str) -> None:
     """
-    Display a table summary of downloaded and failed songs.
-
-    Parameters:
-        console (Console): Rich console used to print the summary.
-        downloaded_songs (List[Dict[str, Any]]): List of dictionaries with keys 'name', 'artist', 'path', 'source'.
-        failed_songs (List[Dict[str, Any]]): List of track info dictionaries that failed to process.
-        download_folder (str): The path to the download directory displayed in the summary.
-
-    Returns:
-        None
+    Print a formatted summary table of successful and failed track downloads to the given Rich console.
+    
+    Detailed behavior:
+    - Renders a Rich Table listing each downloaded track with status "Success", track name, artist, source (if provided), and the saved file path.
+    - Lists failed tracks with status "Failed", track name/artist (uses '-' when missing), and a generic failure detail.
+    - Prints the absolute download folder path and, if any failures occurred, a yellow notice with the count.
+    
+    Expected data shapes:
+    - downloaded_songs: iterable of dicts with required keys 'name', 'artist', 'path' and optional 'source'.
+    - failed_songs: iterable of dict-like objects that may contain 'name' and 'artist'.
     """
     summary_table = Table(title=Text("Download Summary", style="bold magenta"), show_header=True, header_style="bold blue")
     summary_table.add_column("Status", style="dim", width=12)
@@ -94,18 +94,22 @@ def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def initialize_downloader(downloader_cls=SpotifyDownloader):
     """
-    Initialize and return an instance of the Spotify downloader.
-
+    Instantiate and return the provided downloader class.
+    
+    Attempts to create an instance of `downloader_cls` (defaults to `SpotifyDownloader`) and returns it.
+    Initialization errors raised by the underlying downloader constructor (e.g., ValueError, ImportError, RuntimeError)
+    are logged and re-raised.
+    
     Parameters:
-        downloader_cls: Class to instantiate for downloading. Defaults to SpotifyDownloader for normal operation.
-
+        downloader_cls: Callable/Type that constructs a downloader instance. Defaults to `SpotifyDownloader`.
+    
     Returns:
         An instance of the provided downloader class.
-
+    
     Raises:
-        ValueError: If credentials or configuration are invalid.
-        ImportError: If required modules cannot be imported.
-        RuntimeError: For other initialization issues.
+        ValueError: If credentials or configuration are invalid during initialization.
+        ImportError: If required modules for the downloader are missing.
+        RuntimeError: For other initialization issues raised by the downloader.
     """
     try:
         downloader = downloader_cls()
@@ -123,16 +127,18 @@ def initialize_downloader(downloader_cls=SpotifyDownloader):
 
 def process_tracks(downloader, tracks: List[Dict[str, Any]], download_folder: str, console: Console) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Process and download a list of tracks using a provided downloader instance.
-
+    Download and process a list of track dictionaries, returning successful and failed results.
+    
+    Processes each item in `tracks` using the provided downloader; failures for individual tracks are caught and do not stop the overall run.
+    
     Parameters:
-        downloader: Downloader instance with methods get_playlist_tracks and download_song.
-        tracks (List[Dict[str, Any]]): List of track dictionaries with at least 'name' and 'artist' keys.
-        download_folder (str): Destination folder for downloaded files.
-        console (Console): Rich console for progress rendering.
-
+        tracks (List[Dict[str, Any]]): Iterable of track info dicts. Each entry must include at least the 'name' and 'artist' keys.
+        download_folder (str): Destination directory path where downloaded files will be written.
+    
     Returns:
-        Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]: A tuple of (downloaded_songs, failed_songs).
+        Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]: A tuple (downloaded_songs, failed_songs).
+            - downloaded_songs: list of dicts with keys: 'name', 'artist', 'path' (local file path), and 'source' (string identifying the download source).
+            - failed_songs: list of the original track dicts that failed to download or returned no file.
     """
     downloaded_songs: List[Dict[str, Any]] = []
     failed_songs: List[Dict[str, Any]] = []
@@ -186,19 +192,18 @@ def process_tracks(downloader, tracks: List[Dict[str, Any]], download_folder: st
 
 def main() -> None:
     """
-    Main function to parse arguments and start the download process.
-
-    This function is the primary entrypoint invoked when running the CLI.
-    It performs the following steps:
-      - Parses command-line arguments.
-      - Creates UI elements.
-      - Validates Spotify credentials from configuration.
-      - Initializes the Spotify downloader.
-      - Fetches playlist tracks and processes downloads.
-      - Displays a summary table at the end.
-
-    Returns:
-        None
+    Main CLI entry point that orchestrates parsing arguments, initializing the UI and downloader, fetching playlist tracks, downloading them, and showing a final summary.
+    
+    This function performs the end-to-end CLI workflow:
+    - Parse command-line arguments.
+    - Create Rich UI elements.
+    - Validate required Spotify credentials and exit early if missing.
+    - Initialize the Spotify downloader.
+    - Fetch playlist tracks (handles network and fetch errors).
+    - Ensure the download directory exists.
+    - Download tracks via process_tracks and then render a summary table.
+    
+    The function does not return a value; it prints user-facing messages and logs errors as needed.
     """
     # Parse CLI arguments (kept isolated for testability)
     args = parse_arguments()
@@ -255,13 +260,12 @@ def main() -> None:
 
 def setup_logging(log_file_path: str = "music_ripper.log") -> None:
     """
-    Configure global logging handlers and format.
-
+    Configure root logging for the application and write logs to a file.
+    
+    Removes any existing root handlers (to avoid duplicate entries when the module is reloaded) and configures logging.basicConfig with level INFO, a timestamped format, and a FileHandler that appends to the given log file.
+    
     Parameters:
-        log_file_path (str): Path to the logfile. Defaults to 'music_ripper.log'.
-
-    Returns:
-        None
+        log_file_path (str): Path to the log file where messages will be appended (default: "music_ripper.log").
     """
     # Remove old handlers to avoid duplicate logs if script is re-run in same session (e.g. in an IDE)
     for handler in logging.root.handlers[:]:
