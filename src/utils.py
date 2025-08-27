@@ -43,21 +43,21 @@ def sanitize_filename(filename: str) -> str:
 
 def ensure_dir_exists(directory_path: str) -> bool:
     """
-    Ensure that the specified directory exists on the filesystem.
-
-    If the directory does not exist it will be created. Function logs actions and raises OSError on
-    failure to create the directory.
-
-    Args:
-        directory_path: Path to the directory to ensure exists.
-
+    Ensure the given directory exists, creating it if necessary.
+    
+    If the path already exists and is a directory returns False. If the directory is created by
+    this call returns True.
+    
+    Parameters:
+        directory_path (str): Filesystem path to ensure exists.
+    
     Returns:
-        True if the directory was created by this call, False if the directory already existed.
-
+        bool: True when the directory was created, False if it already existed.
+    
     Raises:
-        TypeError: If directory_path is not a string.
+        TypeError: If directory_path is not a str.
         ValueError: If directory_path is empty or only whitespace.
-        OSError: If the directory cannot be created due to an OS-level error.
+        OSError: If an OS-level error occurs while creating the directory.
     """
     if not isinstance(directory_path, str):
         raise TypeError("directory_path must be a string")
