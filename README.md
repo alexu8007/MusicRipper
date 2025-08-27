@@ -51,3 +51,4 @@ python src/main.py <spotify_playlist_link> [download_folder]
 -   `[download_folder]`: (Optional) The folder where songs will be downloaded. Defaults to `Downloads` in the project directory. 
 
 
+
