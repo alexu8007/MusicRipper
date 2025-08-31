@@ -241,7 +241,12 @@ class SpotifyDownloader:
                         with open(metadata_json_path, 'r', encoding='utf-8') as f_json_read:
                             existing_meta = json.load(f_json_read)
                             existing_source = existing_meta.get('download_source', existing_source)
-                    except Exception: pass
+                    except (json.JSONDecodeError, OSError) as e:
+                        # Failed to read or parse existing metadata JSON. Log and proceed; we keep existing_source default.
+                        logger.warning(f"Failed to read/parse metadata JSON at {metadata_json_path}: {e}")
+                    except Exception as e:
+                        # Unexpected error while reading metadata — log full exception for diagnostics, but do not raise to preserve behavior.
+                        logger.exception(f"Unexpected error reading metadata JSON at {metadata_json_path}: {e}")
                 shutil.rmtree(song_specific_temp_base) # Clean up temp base if we skip
                 return final_mp3_path, existing_source
             else:
@@ -360,4 +365,4 @@ if __name__ == "__main__":
                 else:
                     print(f"FAILED: Test track {i+1} download failed.")
         else:
-            print("Could not fetch tracks for testing.") 
+            print("Could not fetch tracks for testing.")
