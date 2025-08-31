@@ -3,6 +3,8 @@
 
 import os
 import logging
+from typing import Callable, Optional, Dict, Any
+
 from pydub import AudioSegment
 from pydub.utils import mediainfo
 
@@ -12,18 +14,130 @@ from .utils import sanitize_filename
 logger = logging.getLogger(__name__)
 
 # Default tolerance for duration check in milliseconds (e.g., 5 seconds)
-DEFAULT_DURATION_TOLERANCE_MS = 5000
+DEFAULT_DURATION_TOLERANCE_MS: int = 5000
 
-def convert_to_mp3_320kbps(input_path: str, output_path: str, 
-                           artist: str = "Unknown Artist", 
-                           title: str = "Unknown Title", 
-                           album: str | None = None, 
-                           track_number: str | None = None, 
-                           year: str | None = None, 
-                           cover_image_path: str | None = None) -> bool:
+
+def _build_id3_tags(artist: str,
+                    title: str,
+                    album: Optional[str] = None,
+                    track_number: Optional[str] = None,
+                    year: Optional[str] = None) -> Dict[str, str]:
     """
-    Converts an audio file to MP3 format at 320kbps.
+    Build a tags dictionary suitable for pydub/ffmpeg export.
+
+    Args:
+        artist: Artist name.
+        title: Track title.
+        album: Optional album name.
+        track_number: Optional track number string.
+        year: Optional release year string.
+
+    Returns:
+        A dict with tag keys/values.
+    """
+    tags: Dict[str, str] = {
+        "artist": artist,
+        "title": title,
+    }
+    if album:
+        tags["album"] = album
+    if track_number:
+        # pydub/ffmpeg usually expect 'tracknumber'
+        tags["tracknumber"] = track_number
+    if year:
+        # pydub/ffmpeg usually expect 'date' for year
+        tags["date"] = year
+    return tags
+
+
+def _ensure_directory_for_file(file_path: str) -> None:
+    """
+    Ensure the parent directory for a given file path exists.
+
+    Args:
+        file_path: Path to a file for which the parent directory will be created.
+
+    Raises:
+        OSError: If the directory cannot be created.
+    """
+    dir_name = os.path.dirname(file_path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+
+
+def _remove_file_safely(file_path: str) -> None:
+    """
+    Attempt to remove a file and log failures without raising.
+
+    Args:
+        file_path: Path to the file to remove.
+    """
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except OSError as rm_e:
+        logger.error("Could not remove partially created/failed output file %s: %s", file_path, rm_e)
+
+
+def _safe_parse_bitrate(bit_rate_str: str) -> int:
+    """
+    Parse bitrate string into an integer number of bits per second.
+
+    Args:
+        bit_rate_str: Bitrate string from mediainfo.
+
+    Returns:
+        Parsed bitrate as int or 0 if parsing fails.
+    """
+    try:
+        return int(bit_rate_str)
+    except (ValueError, TypeError):
+        logger.debug("Could not parse bitrate string '%s'; defaulting to 0", bit_rate_str)
+        return 0
+
+
+def _read_mediainfo(file_path: str, mediainfo_fn: Callable[[str], Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Wrapper around pydub.utils.mediainfo to allow dependency injection and error handling.
+
+    Args:
+        file_path: Path to the media file.
+        mediainfo_fn: Callable that returns media info dictionary.
+
+    Returns:
+        Media info dictionary.
+
+    Raises:
+        FileNotFoundError: If file does not exist.
+        RuntimeError: If mediainfo_fn raises or returns invalid data.
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File does not exist: {file_path}")
+    try:
+        info = mediainfo_fn(file_path)
+        if not isinstance(info, dict):
+            raise RuntimeError("mediainfo function returned unexpected type")
+        return info
+    except Exception as e:
+        logger.error("Error reading media info for %s: %s", file_path, e)
+        raise
+
+
+def convert_to_mp3_320kbps(input_path: str,
+                           output_path: str,
+                           artist: str = "Unknown Artist",
+                           title: str = "Unknown Title",
+                           album: Optional[str] = None,
+                           track_number: Optional[str] = None,
+                           year: Optional[str] = None,
+                           cover_image_path: Optional[str] = None,
+                           audio_loader: Callable[[str], AudioSegment] = AudioSegment.from_file) -> bool:
+    """
+    Converts an audio file to MP3 format at configured bitrate (default 320kbps).
     Adds ID3 tags for artist, title, album, track number, year, and cover art.
+
+    Dependency injection is supported via the `audio_loader` parameter to allow
+    tests to mock audio loading behavior.
 
     Args:
         input_path: Path to the input audio file.
@@ -34,109 +148,153 @@ def convert_to_mp3_320kbps(input_path: str, output_path: str,
         track_number: Track number for ID3 tag.
         year: Release year for ID3 tag.
         cover_image_path: Path to the cover image file.
+        audio_loader: Callable that loads audio and returns an AudioSegment.
 
     Returns:
         True if conversion was successful, False otherwise.
     """
     try:
-        logger.info(f"Attempting to convert {input_path} to MP3 320kbps with extended metadata.")
-        audio = AudioSegment.from_file(input_path)
-        
-        tags = {
-            "artist": artist,
-            "title": title,
-        }
-        if album:
-            tags["album"] = album
-        if track_number:
-            tags["tracknumber"] = track_number # pydub/ffmpeg usually expect 'tracknumber'
-        if year:
-            tags["date"] = year # pydub/ffmpeg usually expect 'date' for year
-        
-        # Ensure output directory exists
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        logger.info("Attempting to convert %s to MP3 %s with extended metadata.", input_path, DEFAULT_AUDIO_BITRATE)
 
-        export_params = {
+        if not os.path.exists(input_path):
+            logger.warning("Input file for conversion does not exist: %s", input_path)
+            return False
+
+        # Load audio (may load entire file into memory depending on backend)
+        try:
+            audio: AudioSegment = audio_loader(input_path)
+        except FileNotFoundError:
+            logger.error("Input file not found during load: %s", input_path)
+            return False
+        except Exception as e:
+            logger.error("Error loading audio file %s: %s", input_path, e)
+            return False
+
+        tags = _build_id3_tags(artist=artist, title=title, album=album, track_number=track_number, year=year)
+
+        # Ensure output directory exists
+        try:
+            _ensure_directory_for_file(output_path)
+        except OSError as e:
+            logger.error("Could not create output directory for %s: %s", output_path, e)
+            return False
+
+        export_params: Dict[str, Any] = {
             "format": DEFAULT_AUDIO_FORMAT,
             "bitrate": DEFAULT_AUDIO_BITRATE,
             "tags": tags
         }
 
-        if cover_image_path and os.path.exists(cover_image_path):
-            export_params["cover"] = cover_image_path
-            logger.info(f"Embedding cover art from: {cover_image_path}")
-        elif cover_image_path:
-            logger.warning(f"Cover image path provided ({cover_image_path}) but file not found. Skipping cover art.")
+        if cover_image_path:
+            if os.path.exists(cover_image_path):
+                export_params["cover"] = cover_image_path
+                logger.info("Embedding cover art from: %s", cover_image_path)
+            else:
+                logger.warning("Cover image path provided (%s) but file not found. Skipping cover art.", cover_image_path)
 
-        audio.export(output_path, **export_params)
-        logger.info(f"Successfully converted {input_path} to {output_path} at {DEFAULT_AUDIO_BITRATE} with extended tags.")
-        return True
+        try:
+            # Export may create the file; guard and clean up on failure
+            audio.export(output_path, **export_params)
+            logger.info("Successfully converted %s to %s at %s with extended tags.", input_path, output_path, DEFAULT_AUDIO_BITRATE)
+            return True
+        except Exception as e:
+            logger.error("Error exporting audio to %s: %s", output_path, e)
+            _remove_file_safely(output_path)
+            return False
     except Exception as e:
-        logger.error(f"Error converting {input_path} to MP3: {e}")
-        # If output_path was created despite error, remove it
-        if os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-            except OSError as rm_e:
-                logger.error(f"Could not remove partially created/failed output file {output_path}: {rm_e}")
+        # Catch-all to prevent unexpected exceptions from propagating while logging detail.
+        logger.error("Unexpected error during conversion of %s: %s", input_path, e)
+        _remove_file_safely(output_path)
         return False
 
-def validate_mp3_320kbps(file_path: str, expected_duration_ms: int | None = None, duration_tolerance_ms: int = DEFAULT_DURATION_TOLERANCE_MS) -> bool:
+
+def validate_mp3_320kbps(file_path: str,
+                         expected_duration_ms: Optional[int] = None,
+                         duration_tolerance_ms: int = DEFAULT_DURATION_TOLERANCE_MS,
+                         mediainfo_fn: Callable[[str], Dict[str, Any]] = mediainfo,
+                         audio_loader: Callable[[str], AudioSegment] = AudioSegment.from_file) -> bool:
     """
-    Validates if a file is an MP3, has a bitrate of approximately 320kbps,
+    Validates if a file is an MP3 and has a bitrate close to 320kbps,
     and optionally matches an expected duration within a tolerance.
+
+    Dependency injection is supported for `mediainfo_fn` and `audio_loader` to
+    facilitate testing and mocking of external libraries.
 
     Args:
         file_path: Path to the audio file.
         expected_duration_ms: Expected duration of the audio in milliseconds.
         duration_tolerance_ms: Tolerance for the duration check in milliseconds.
+        mediainfo_fn: Function used to obtain media info (defaults to pydub.utils.mediainfo).
+        audio_loader: Callable used to load audio when duration validation is required.
 
     Returns:
         True if validation passes, False otherwise.
     """
     if not os.path.exists(file_path):
-        logger.warning(f"Validation failed: File {file_path} does not exist.")
+        logger.warning("Validation failed: File %s does not exist.", file_path)
         return False
 
     try:
-        info = mediainfo(file_path)
-        # print(f"Media Info for {file_path}: {info}") # For debugging
-        
-        file_format = info.get("format_name", "").lower()
+        info = _read_mediainfo(file_path, mediainfo_fn)
+
+        file_format = str(info.get("format_name", "")).lower()
         bit_rate_str = info.get("bit_rate", "0")
-        
+
         is_mp3 = "mp3" in file_format
-        
-        # Bitrate can sometimes be slightly off, e.g., 320000 vs 319999
-        # We check if it's close to 320000 (320 kbps)
-        bit_rate = int(bit_rate_str)
-        is_320kbps = (315000 <= bit_rate <= 325000) # Allowing a small tolerance
+
+        bit_rate = _safe_parse_bitrate(bit_rate_str)
+        # Allowing a small tolerance around 320000 bps
+        is_320kbps = (315_000 <= bit_rate <= 325_000)
 
         if not (is_mp3 and is_320kbps):
-            logger.warning(f"Validation failed for {file_path}: Format={file_format}, Bitrate={bit_rate}bps. Expected MP3 and ~320kbps.")
+            logger.warning(
+                "Validation failed for %s: Format=%s, Bitrate=%sbps. Expected MP3 and ~320kbps.",
+                file_path,
+                file_format,
+                bit_rate,
+            )
             return False
-        
+
         # Duration Check (if expected_duration_ms is provided)
         if expected_duration_ms is not None:
             try:
-                audio = AudioSegment.from_file(file_path)
+                # Loading audio to inspect duration; injected loader helps testing.
+                audio = audio_loader(file_path)
                 actual_duration_ms = int(audio.duration_seconds * 1000)
                 lower_bound = expected_duration_ms - duration_tolerance_ms
                 upper_bound = expected_duration_ms + duration_tolerance_ms
 
                 if not (lower_bound <= actual_duration_ms <= upper_bound):
-                    logger.warning(f"Validation failed for {file_path}: Duration mismatch. Expected {expected_duration_ms}ms, got {actual_duration_ms}ms (Tolerance: {duration_tolerance_ms}ms).")
+                    logger.warning(
+                        "Validation failed for %s: Duration mismatch. Expected %dms, got %dms (Tolerance: %dms).",
+                        file_path,
+                        expected_duration_ms,
+                        actual_duration_ms,
+                        duration_tolerance_ms,
+                    )
                     return False
-                logger.info(f"Duration validation successful for {file_path}: Expected {expected_duration_ms}ms, got {actual_duration_ms}ms.")
+                logger.info(
+                    "Duration validation successful for %s: Expected %dms, got %dms.",
+                    file_path,
+                    expected_duration_ms,
+                    actual_duration_ms,
+                )
+            except FileNotFoundError:
+                logger.error("File not found while validating duration: %s", file_path)
+                return False
             except Exception as e:
-                logger.error(f"Error getting duration for {file_path}: {e}")
-                return False # Fail validation if duration can't be read
+                logger.error("Error getting duration for %s: %s", file_path, e)
+                return False  # Fail validation if duration can't be read
 
-        logger.info(f"Validation successful for {file_path}: Format={file_format}, Bitrate={bit_rate}bps.")
+        logger.info("Validation successful for %s: Format=%s, Bitrate=%sbps.", file_path, file_format, bit_rate)
         return True
-    except Exception as e:
-        logger.error(f"Error validating {file_path}: {e}")
+    except FileNotFoundError:
+        logger.warning("Validation failed: File %s does not exist.", file_path)
         return False
+    except Exception as e:
+        logger.error("Error validating %s: %s", file_path, e)
+        return False
+
 
 # Example usage (for testing this module directly):
 if __name__ == "__main__":
@@ -212,4 +370,4 @@ if __name__ == "__main__":
             except OSError:
                 pass # Directory might not be empty if other files were created
     else:
-        print(f"Skipping audio_processor tests as input file {input_dummy_file} was not available/creatable.") 
+        print(f"Skipping audio_processor tests as input file {input_dummy_file} was not available/creatable.")
