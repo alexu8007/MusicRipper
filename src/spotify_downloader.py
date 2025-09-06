@@ -241,7 +241,10 @@ class SpotifyDownloader:
                         with open(metadata_json_path, 'r', encoding='utf-8') as f_json_read:
                             existing_meta = json.load(f_json_read)
                             existing_source = existing_meta.get('download_source', existing_source)
-                    except Exception: pass
+                    except (json.JSONDecodeError, OSError) as e:
+                        # It's safe to ignore metadata read errors here (corrupted JSON or ephemeral filesystem issues).
+                        # We log a warning and proceed, treating the source as Unknown/Existing to preserve backward-compatible behavior.
+                        logger.warning(f"Could not read metadata JSON {metadata_json_path}: {e}")
                 shutil.rmtree(song_specific_temp_base) # Clean up temp base if we skip
                 return final_mp3_path, existing_source
             else:
@@ -328,6 +331,39 @@ class SpotifyDownloader:
 # Example usage (for testing this module directly):
 if __name__ == "__main__":
     print("Testing SpotifyDownloader with iterative source attempts...")
+    # Brief unit test to assert that invalid/corrupted metadata JSON does not crash and results in Unknown/Existing source.
+    def _unit_test_invalid_metadata_handling():
+        import tempfile as _tempfile, os as _os
+        print("Running unit test: invalid metadata handling")
+        tempdir = _tempfile.mkdtemp(prefix="sdown_test_")
+        try:
+            track_info = {'artist': 'Test Artist', 'name': 'Test Song', 'spotify_track_id': 'test123', 'duration_ms': None}
+            sanitized = sanitize_filename(f"{track_info['artist']} - {track_info['name']}")
+            final_mp3_path = _os.path.join(tempdir, f"{sanitized}.{DEFAULT_AUDIO_FORMAT}")
+            metadata_json_path = _os.path.join(tempdir, f"{sanitized}.json")
+            # create fake mp3 file
+            with open(final_mp3_path, 'wb') as f: f.write(b'FAKEMP3')
+            # create invalid json
+            with open(metadata_json_path, 'w', encoding='utf-8') as f: f.write("not a json")
+            # monkeypatch validate_mp3_320kbps to return True so download_song treats the existing file as valid
+            original_validate = globals().get('validate_mp3_320kbps')
+            globals()['validate_mp3_320kbps'] = lambda *a, **k: True
+            try:
+                downloader = object.__new__(SpotifyDownloader)
+                result_path, existing_source = downloader.download_song(track_info, tempdir)
+                assert result_path == final_mp3_path, f"Expected {final_mp3_path}, got {result_path}"
+                assert existing_source == "Unknown/Existing", f"Expected Unknown/Existing, got {existing_source}"
+                print("Unit test passed: invalid metadata JSON is handled and defaults to Unknown/Existing")
+            finally:
+                # restore original validate function
+                if original_validate is not None:
+                    globals()['validate_mp3_320kbps'] = original_validate
+        finally:
+            try: shutil.rmtree(tempdir)
+            except Exception: pass
+
+    _unit_test_invalid_metadata_handling()
+
     load_dotenv_path = os.path.join(os.path.dirname(__file__), "..", ".env")
     from dotenv import load_dotenv
     if os.path.exists(load_dotenv_path):
@@ -360,4 +396,4 @@ if __name__ == "__main__":
                 else:
                     print(f"FAILED: Test track {i+1} download failed.")
         else:
-            print("Could not fetch tracks for testing.") 
+            print("Could not fetch tracks for testing.")
