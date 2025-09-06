@@ -1,0 +1,275 @@
+import ast
+import json
+import os
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+
+def generate_github_actions_workflow() -> str:
+    """
+    Generate a GitHub Actions workflow YAML string that runs linting, type checking,
+    and tests. This is a lightweight CI template intended to be added to
+    .github/workflows/quality.yml in the repository.
+    The workflow uses Python package managers and common tools (ruff, mypy, pytest).
+    It does not modify source files; it only defines CI steps that will run
+    in the repository CI environment.
+    """
+    return """name: Quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff mypy pytest
+      - name: Run ruff (lint)
+        run: |
+          ruff check .
+      - name: Run mypy (type checking)
+        run: |
+          mypy --ignore-missing-imports .
+      - name: Run tests
+        run: |
+          pytest -q
+"""
+
+
+def generate_contributing_md() -> str:
+    """
+    Produce a CONTRIBUTING.md content string that documents coding standards,
+    testing guidance, and the requirement to preserve public APIs during refactors.
+    This text is intended to be appended to or written to CONTRIBUTING.md by a maintainer.
+    """
+    return """# Contributing
+
+This repository follows a quality-first approach. Please follow these guidelines when contributing:
+
+- Preserve public APIs: When refactoring, ensure existing public functions, classes, and module-level behavior remain compatible.
+- Run linters and type checks locally where possible:
+  - ruff for linting and formatting
+  - mypy for static type checking
+- Add unit tests for new behavior and extract side-effect-free functions to make them testable.
+- Keep functions small and focused; prefer single-responsibility functions.
+- When modifying code, update or add tests in the tests/ directory and ensure the CI passes.
+
+For more details, see repository README and existing test patterns.
+"""
+
+
+def scan_python_files(root: Path) -> List[Path]:
+    """
+    Recursively scan the repository root for .py files, excluding typical
+    virtual environment and hidden directories.
+    """
+    python_files: List[Path] = []
+    for path in root.rglob("*.py"):
+        # Filter out common dirs that should not be scanned
+        parts = set(path.parts)
+        if {
+            ".venv",
+            "venv",
+            "__pycache__",
+            ".git",
+            ".mypy_cache",
+            "build",
+            "dist",
+        } & parts:
+            continue
+        python_files.append(path)
+    return python_files
+
+
+def compute_function_complexity(func_node: ast.AST) -> int:
+    """
+    Compute a simple cyclomatic complexity approximation for a function-like AST node.
+    The complexity starts at 1 and increases for branching constructs.
+    """
+    complexity = 1
+
+    branching_kinds = (
+        ast.If,
+        ast.For,
+        ast.While,
+        ast.With,
+        ast.AsyncWith,
+        ast.AsyncFor,
+        ast.Try,
+        ast.ExceptHandler,
+        ast.BoolOp,
+        ast.IfExp,
+        ast.Match,  # Python 3.10+ pattern matching
+    )
+
+    # Walk all nodes inside the function and count branching constructs
+    for node in ast.walk(func_node):
+        if isinstance(node, branching_kinds):
+            complexity += 1
+        # Count boolean operators separately by number of operands - 1 (n operands -> n-1 decisions)
+        if isinstance(node, ast.BoolOp):
+            # node.values is a list of operands
+            complexity += max(0, len(node.values) - 1)
+        # Count comprehensions which may hide conditional logic
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            # Each generator with an 'if' clause increases complexity
+            for gen in getattr(node, "generators", []):
+                if getattr(gen, "ifs", None):
+                    complexity += len(gen.ifs)
+    return complexity
+
+
+def analyze_file_complexities(path: Path) -> List[Dict[str, object]]:
+    """
+    Parse a Python file and return a list of dictionaries describing
+    each function or async function with its computed complexity.
+    Each dict contains: module_path, function_name, lineno, complexity.
+    """
+    try:
+        source = path.read_text(encoding="utf-8")
+    except Exception:
+        return []
+
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError:
+        return []
+
+    results: List[Dict[str, object]] = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = getattr(node, "name", "<lambda>")
+            lineno = getattr(node, "lineno", 0)
+            complexity = compute_function_complexity(node)
+            results.append(
+                {
+                    "file": str(path),
+                    "function": name,
+                    "lineno": lineno,
+                    "complexity": complexity,
+                }
+            )
+        # Also consider top-level lambda and comprehensions? We focus on named functions.
+    return results
+
+
+def find_complexity_hotspots(root: Path, threshold: int = 15) -> List[Dict[str, object]]:
+    """
+    Scan all Python files under root and return a sorted list of functions whose
+    complexity exceeds the given threshold. The list is sorted descending by complexity.
+    """
+    python_files = scan_python_files(root)
+    all_results: List[Dict[str, object]] = []
+    for p in python_files:
+        all_results.extend(analyze_file_complexities(p))
+    hotspots = [r for r in all_results if r["complexity"] > threshold]
+    hotspots.sort(key=lambda x: x["complexity"], reverse=True)
+    return hotspots
+
+
+def write_text_file(dest: Path, content: str) -> None:
+    """
+    Write content to the given destination path, creating parent directories if needed.
+    This helper is safe to call from CI or developer environments.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(content, encoding="utf-8")
+
+
+def generate_quality_report(root: Path, threshold: int = 15) -> Dict[str, object]:
+    """
+    Generate a JSON-serializable quality report that includes:
+    - number of scanned python files
+    - number of functions analyzed
+    - list of complexity hotspots
+    - recommended CI and contributing snippets (as strings)
+    """
+    python_files = scan_python_files(root)
+    all_functions = []
+    for p in python_files:
+        all_functions.extend(analyze_file_complexities(p))
+    hotspots = [f for f in all_functions if f["complexity"] > threshold]
+    hotspots.sort(key=lambda x: x["complexity"], reverse=True)
+
+    report = {
+        "scanned_files_count": len(python_files),
+        "analyzed_functions_count": len(all_functions),
+        "hotspots_count": len(hotspots),
+        "hotspots": hotspots,
+        "ci_workflow_suggested_path": ".github/workflows/quality.yml",
+        "contributing_suggested_path": "CONTRIBUTING.md",
+    }
+    return report
+
+
+def main(root_path: str = ".") -> int:
+    """
+    Main entrypoint for generating the repository quality artifacts.
+
+    Actions performed:
+      - Scan repository for Python files and compute function complexity metrics.
+      - Generate a JSON quality report at quality_report.json in the repository root.
+      - Write a GitHub Actions workflow template to .github/workflows/quality.yml.
+      - Write a CONTRIBUTING.md snippet to CONTRIBUTING.md if the file does not already exist.
+
+    Returns exit code 0 on success.
+    """
+    root = Path(root_path).resolve()
+    report = generate_quality_report(root)
+
+    # Write report
+    report_path = root / "quality_report.json"
+    write_text_file(report_path, json.dumps(report, indent=2))
+
+    # Suggest CI workflow
+    ci_path = root / ".github" / "workflows" / "quality.yml"
+    ci_content = generate_github_actions_workflow()
+    # Only write CI workflow if it does not already exist to avoid overwriting existing CI
+    if not ci_path.exists():
+        write_text_file(ci_path, ci_content)
+
+    # Suggest CONTRIBUTING.md - do not overwrite if present
+    contributing_path = root / "CONTRIBUTING.md"
+    if not contributing_path.exists():
+        write_text_file(contributing_path, generate_contributing_md())
+
+    # Also produce a brief summary printed to stdout when executed
+    summary_lines = [
+        f"Scanned Python files: {report['scanned_files_count']}",
+        f"Analyzed functions: {report['analyzed_functions_count']}",
+        f"Complexity hotspots (>15): {report['hotspots_count']}",
+    ]
+    if report["hotspots_count"] > 0:
+        summary_lines.append("Top hotspots (file:function:lineno -> complexity):")
+        for h in report["hotspots"][:10]:
+            summary_lines.append(
+                f" - {Path(h['file']).name}:{h['function']}:{h['lineno']} -> {h['complexity']}"
+            )
+    summary = "\n".join(summary_lines)
+    print(summary)
+    print(f"\nWrote quality report to: {report_path}")
+    if not ci_path.exists():
+        print(f"Wrote CI workflow template to: {ci_path}")
+    else:
+        print(f"CI workflow already exists at: {ci_path}")
+    if not contributing_path.exists():
+        print(f"Wrote CONTRIBUTING.md to: {contributing_path}")
+    else:
+        print(f"CONTRIBUTING.md already exists at: {contributing_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    exit(main("."))
