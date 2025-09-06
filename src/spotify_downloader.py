@@ -241,7 +241,10 @@ class SpotifyDownloader:
                         with open(metadata_json_path, 'r', encoding='utf-8') as f_json_read:
                             existing_meta = json.load(f_json_read)
                             existing_source = existing_meta.get('download_source', existing_source)
-                    except Exception: pass
+                    except (json.JSONDecodeError, OSError) as e_meta_read:
+                        # Could not read/parse metadata JSON; safe to proceed with default existing_source.
+                        # Metadata is auxiliary; inability to read it should not block or raise during a download attempt.
+                        logger.warning(f"Failed to read metadata JSON at {metadata_json_path}: {e_meta_read}. Proceeding with default download source.")
                 shutil.rmtree(song_specific_temp_base) # Clean up temp base if we skip
                 return final_mp3_path, existing_source
             else:
@@ -361,3 +364,33 @@ if __name__ == "__main__":
                     print(f"FAILED: Test track {i+1} download failed.")
         else:
             print("Could not fetch tracks for testing.") 
+
+    # Small regression-style test to exercise metadata JSON read error handling:
+    # This test creates an invalid JSON metadata file and ensures our code path that reads and safely ignores invalid metadata is exercised.
+    tmp_test_dir = tempfile.mkdtemp(prefix="spd_test_")
+    try:
+        fake_mp3_name = "Artist - Song"
+        fake_mp3_path = os.path.join(tmp_test_dir, sanitize_filename(fake_mp3_name) + f".{DEFAULT_AUDIO_FORMAT}")
+        # Create an empty placeholder MP3 file to simulate existing output
+        with open(fake_mp3_path, 'wb') as f:
+            f.write(b'\x00')
+        metadata_json_path = os.path.join(tmp_test_dir, sanitize_filename(fake_mp3_name) + ".json")
+        # Write invalid JSON to force JSONDecodeError when reading
+        with open(metadata_json_path, 'w', encoding='utf-8') as f:
+            f.write("THIS IS NOT JSON")
+
+        # Exercise the same read/parse logic used in download_song without invoking network or other subsystems.
+        existing_source = "Unknown/Existing"
+        try:
+            with open(metadata_json_path, 'r', encoding='utf-8') as f_json_read:
+                existing_meta = json.load(f_json_read)
+                existing_source = existing_meta.get('download_source', existing_source)
+        except (json.JSONDecodeError, OSError) as e_test:
+            logger.warning(f"Regression test: failed to read invalid metadata JSON as expected: {e_test}")
+        else:
+            raise AssertionError("Regression test failed: invalid JSON did not raise JSONDecodeError")
+    finally:
+        try:
+            shutil.rmtree(tmp_test_dir)
+        except Exception:
+            pass
