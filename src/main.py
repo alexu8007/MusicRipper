@@ -5,6 +5,7 @@ import argparse
 import os
 import logging
 import sys
+from typing import Any, Dict, List, Optional, Tuple
 
 from rich.console import Console
 from rich.table import Table
@@ -19,23 +20,38 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.spotify_downloader import SpotifyDownloader
 from src.config import DEFAULT_DOWNLOAD_DIR, SPOTIPY_CLIENT_ID, SPOTIPY_CLIENT_SECRET
-from src.utils import ensure_dir_exists, sanitize_filename # For logging configuration in utils
+from src.utils import ensure_dir_exists, sanitize_filename  # For logging configuration in utils
 
 # Configure logging (ensure utils.py logging setup is respected or overridden here if needed)
 # The basicConfig in utils.py would have already set up root logger.
 # If more specific setup for main is needed, it can be done here.
-logger = logging.getLogger(__name__) # Get a logger specific to this module
-# Example: if you want to set a different level for this module's logger:
-# logger.setLevel(logging.DEBUG) 
+logger = logging.getLogger(__name__)  # Get a logger specific to this module
 
 
-def create_ui_elements():
-    """Creates Rich UI elements (console, tables, progress bars)."""
+def create_ui_elements() -> Console:
+    """
+    Create and return the Rich Console instance used for UI output.
+
+    Returns:
+        Console: A Rich Console instance for printing styled output.
+    """
     console = Console()
     return console
 
-def display_summary(console: Console, downloaded_songs: list, failed_songs: list, download_folder: str):
-    """Displays a summary of the download process."""
+
+def display_summary(console: Console, downloaded_songs: List[Dict[str, Any]], failed_songs: List[Dict[str, Any]], download_folder: str) -> None:
+    """
+    Display a table summary of downloaded and failed songs.
+
+    Parameters:
+        console (Console): Rich console used to print the summary.
+        downloaded_songs (List[Dict[str, Any]]): List of dictionaries with keys 'name', 'artist', 'path', 'source'.
+        failed_songs (List[Dict[str, Any]]): List of track info dictionaries that failed to process.
+        download_folder (str): The path to the download directory displayed in the summary.
+
+    Returns:
+        None
+    """
     summary_table = Table(title=Text("Download Summary", style="bold magenta"), show_header=True, header_style="bold blue")
     summary_table.add_column("Status", style="dim", width=12)
     summary_table.add_column("Track Name")
@@ -45,9 +61,9 @@ def display_summary(console: Console, downloaded_songs: list, failed_songs: list
 
     for song in downloaded_songs:
         summary_table.add_row("[green]Success[/green]", song['name'], song['artist'], song.get('source', 'N/A'), f"Saved to {song['path']}")
-    
+
     for song_info in failed_songs:
-        summary_table.add_row("[red]Failed[/red]", song_info['name'], song_info['artist'], "-", "Could not download/process")
+        summary_table.add_row("[red]Failed[/red]", song_info.get('name', '-'), song_info.get('artist', '-'), "-", "Could not download/process")
 
     console.print(summary_table)
     console.print(f"\nAll processing finished. Files are in: [cyan]{os.path.abspath(download_folder)}[/cyan]")
@@ -55,49 +71,71 @@ def display_summary(console: Console, downloaded_songs: list, failed_songs: list
         console.print(f"[yellow]{len(failed_songs)} song(s) could not be processed. Check logs for details.[/yellow]")
 
 
-def main():
-    """Main function to parse arguments and start the download process."""
+def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """
+    Parse CLI arguments for the application.
+
+    Parameters:
+        argv (Optional[List[str]]): Optional list of arguments (for testing). Defaults to None which uses sys.argv.
+
+    Returns:
+        argparse.Namespace: Parsed arguments with attributes 'playlist_url' and 'download_folder'.
+    """
     parser = argparse.ArgumentParser(description=Text("Spotify Playlist Downloader", style="bold green"))
     parser.add_argument("playlist_url", help="The URL of the Spotify playlist to download.")
     parser.add_argument(
-        "download_folder", 
-        nargs='?', 
-        default=DEFAULT_DOWNLOAD_DIR, 
+        "download_folder",
+        nargs='?',
+        default=DEFAULT_DOWNLOAD_DIR,
         help=f"The folder where songs will be downloaded. Defaults to '{DEFAULT_DOWNLOAD_DIR}' in the current directory."
     )
+    return parser.parse_args(argv)
 
-    args = parser.parse_args()
-    console = create_ui_elements()
 
-    console.print(Panel(Text("Spotify Music Ripper Initializing...", justify="center", style="bold blue")))
+def initialize_downloader(downloader_cls=SpotifyDownloader):
+    """
+    Initialize and return an instance of the Spotify downloader.
 
-    if not SPOTIPY_CLIENT_ID or not SPOTIPY_CLIENT_SECRET:
-        console.print("[bold red]Error: Spotify API credentials (SPOTIPY_CLIENT_ID, SPOTIPY_CLIENT_SECRET) not found.[/bold red]")
-        console.print("Please set them in a .env file in the project root as per the README.md.")
-        return
+    Parameters:
+        downloader_cls: Class to instantiate for downloading. Defaults to SpotifyDownloader for normal operation.
 
+    Returns:
+        An instance of the provided downloader class.
+
+    Raises:
+        ValueError: If credentials or configuration are invalid.
+        ImportError: If required modules cannot be imported.
+        RuntimeError: For other initialization issues.
+    """
     try:
-        downloader = SpotifyDownloader()
-    except ValueError as e:
-        console.print(f"[bold red]Error initializing Spotify Downloader: {e}[/bold red]")
-        return
-    except Exception as e:
-        console.print(f"[bold red]An unexpected error occurred during initialization: {e}[/bold red]")
-        logger.error(f"Initialization failed: {e}", exc_info=True)
-        return
+        downloader = downloader_cls()
+        return downloader
+    except ValueError as exc:
+        logger.error("ValueError during downloader initialization: %s", exc, exc_info=True)
+        raise
+    except ImportError as exc:
+        logger.error("ImportError during downloader initialization: %s", exc, exc_info=True)
+        raise
+    except RuntimeError as exc:
+        logger.error("RuntimeError during downloader initialization: %s", exc, exc_info=True)
+        raise
 
-    console.print(f"Fetching track list from playlist: [link={args.playlist_url}]{args.playlist_url}[/link]")
-    tracks = downloader.get_playlist_tracks(args.playlist_url)
 
-    if not tracks:
-        console.print("[yellow]No tracks found in the playlist or could not fetch tracks. Exiting.[/yellow]")
-        return
+def process_tracks(downloader, tracks: List[Dict[str, Any]], download_folder: str, console: Console) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Process and download a list of tracks using a provided downloader instance.
 
-    console.print(f"Found {len(tracks)} tracks. Preparing to download to: [cyan]{os.path.abspath(args.download_folder)}[/cyan]")
-    ensure_dir_exists(args.download_folder)
+    Parameters:
+        downloader: Downloader instance with methods get_playlist_tracks and download_song.
+        tracks (List[Dict[str, Any]]): List of track dictionaries with at least 'name' and 'artist' keys.
+        download_folder (str): Destination folder for downloaded files.
+        console (Console): Rich console for progress rendering.
 
-    downloaded_songs = []
-    failed_songs = []
+    Returns:
+        Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]: A tuple of (downloaded_songs, failed_songs).
+    """
+    downloaded_songs: List[Dict[str, Any]] = []
+    failed_songs: List[Dict[str, Any]] = []
 
     # Rich progress bar setup
     with Progress(
@@ -108,58 +146,151 @@ def main():
         TimeRemainingColumn(),
         TimeElapsedColumn(),
         console=console,
-        transient=False # Keep progress bar visible after completion for a moment or until next print
+        transient=False  # Keep progress bar visible after completion for a moment or until next print
     ) as progress:
         task_download = progress.add_task("[green]Downloading songs...", total=len(tracks))
 
         for i, track_info in enumerate(tracks):
-            progress.update(task_download, description=f"Processing: {track_info['artist']} - {track_info['name']}")
-            
-            # Attempt to download the song
-            file_path, source_name = downloader.download_song(track_info, args.download_folder)
-            
-            if file_path:
-                downloaded_songs.append({
-                    "name": track_info["name"], 
-                    "artist": track_info["artist"], 
-                    "path": file_path,
-                    "source": source_name or "Unknown" # Store the source
-                })
-                logger.info(f"Successfully processed: {track_info['artist']} - {track_info['name']} from {source_name}")
-            else:
+            progress.update(task_download, description=f"Processing: {track_info.get('artist', 'Unknown')} - {track_info.get('name', 'Unknown')}")
+
+            # Attempt to download the song; guard against unexpected exceptions per-track so a single failure doesn't stop the whole run.
+            try:
+                file_path, source_name = downloader.download_song(track_info, download_folder)
+            except (OSError, RuntimeError) as exc:
+                logger.exception("Failed to download/process track '%s' by '%s' due to system/runtime error.", track_info.get('name'), track_info.get('artist'))
                 failed_songs.append(track_info)
-                logger.warning(f"Failed to process: {track_info['artist']} - {track_info['name']}")
-            
+            except Exception as exc:
+                # Log unexpected exceptions with trace to aid debugging but continue processing remaining tracks.
+                logger.exception("Unexpected error while processing track '%s' by '%s': %s", track_info.get('name'), track_info.get('artist'), exc)
+                failed_songs.append(track_info)
+            else:
+                if file_path:
+                    downloaded_songs.append({
+                        "name": track_info["name"],
+                        "artist": track_info["artist"],
+                        "path": file_path,
+                        "source": source_name or "Unknown"  # Store the source
+                    })
+                    logger.info("Successfully processed: %s - %s from %s", track_info["artist"], track_info["name"], source_name)
+                else:
+                    failed_songs.append(track_info)
+                    logger.warning("Failed to process (no file returned): %s - %s", track_info.get("artist"), track_info.get("name"))
+
             progress.advance(task_download)
-        
-        # Ensure progress bar finishes if transient=False is not fully effective or if you want a final message within it.
+
+        # Ensure progress bar finishes with a final description.
         progress.update(task_download, description="[bold green]All tracks processed![/bold green]")
 
+    return downloaded_songs, failed_songs
+
+
+def main() -> None:
+    """
+    Main function to parse arguments and start the download process.
+
+    This function is the primary entrypoint invoked when running the CLI.
+    It performs the following steps:
+      - Parses command-line arguments.
+      - Creates UI elements.
+      - Validates Spotify credentials from configuration.
+      - Initializes the Spotify downloader.
+      - Fetches playlist tracks and processes downloads.
+      - Displays a summary table at the end.
+
+    Returns:
+        None
+    """
+    # Parse CLI arguments (kept isolated for testability)
+    args = parse_arguments()
+
+    # Create console/UI elements
+    console = create_ui_elements()
+    console.print(Panel(Text("Spotify Music Ripper Initializing...", justify="center", style="bold blue")))
+
+    # Validate environment/config values required for Spotify access
+    if not SPOTIPY_CLIENT_ID or not SPOTIPY_CLIENT_SECRET:
+        console.print("[bold red]Error: Spotify API credentials (SPOTIPY_CLIENT_ID, SPOTIPY_CLIENT_SECRET) not found.[/bold red]")
+        console.print("Please set them in a .env file in the project root as per the README.md.")
+        return
+
+    # Initialize the downloader with dependency-injection-friendly initializer
+    try:
+        downloader = initialize_downloader()
+    except (ValueError, ImportError, RuntimeError) as e:
+        console.print(f"[bold red]Error initializing Spotify Downloader: {e}[/bold red]")
+        return
+
+    # Fetch track list from the provided playlist URL
+    console.print(f"Fetching track list from playlist: [link={args.playlist_url}]{args.playlist_url}[/link]")
+    try:
+        tracks = downloader.get_playlist_tracks(args.playlist_url)
+    except (RuntimeError, ConnectionError) as exc:
+        logger.exception("Failed to fetch playlist tracks for URL %s", args.playlist_url)
+        console.print(f"[bold red]Failed to fetch tracks: {exc}[/bold red]")
+        return
+    except Exception as exc:
+        # Unexpected exceptions should be logged and surfaced to the user in a friendly manner.
+        logger.exception("Unexpected error fetching playlist tracks: %s", exc)
+        console.print(f"[bold red]An unexpected error occurred while fetching tracks: {exc}[/bold red]")
+        return
+
+    if not tracks:
+        console.print("[yellow]No tracks found in the playlist or could not fetch tracks. Exiting.[/yellow]")
+        return
+
+    console.print(f"Found {len(tracks)} tracks. Preparing to download to: [cyan]{os.path.abspath(args.download_folder)}[/cyan]")
+    try:
+        ensure_dir_exists(args.download_folder)
+    except OSError as exc:
+        logger.exception("Failed to ensure download directory exists: %s", args.download_folder)
+        console.print(f"[bold red]Failed to prepare download directory: {exc}[/bold red]")
+        return
+
+    # Process tracks (download loop encapsulated for clarity and testability)
+    downloaded_songs, failed_songs = process_tracks(downloader, tracks, args.download_folder, console)
+
+    # Display final summary
     display_summary(console, downloaded_songs, failed_songs, args.download_folder)
 
-if __name__ == "__main__":
-    # Set up global logging to a file, in addition to console output handled by Rich.
-    # This should be done once, preferably at the very start.
-    log_file_path = "music_ripper.log"
+
+def setup_logging(log_file_path: str = "music_ripper.log") -> None:
+    """
+    Configure global logging handlers and format.
+
+    Parameters:
+        log_file_path (str): Path to the logfile. Defaults to 'music_ripper.log'.
+
+    Returns:
+        None
+    """
     # Remove old handlers to avoid duplicate logs if script is re-run in same session (e.g. in an IDE)
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
-    
+
     logging.basicConfig(
-        level=logging.INFO, 
+        level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         handlers=[
-            logging.FileHandler(log_file_path, mode='a'), # Append mode
+            logging.FileHandler(log_file_path, mode='a'),  # Append mode
             # logging.StreamHandler() # Already handled by Rich for console, but could be added if needed
         ]
     )
+
+
+if __name__ == "__main__":
+    # Set up global logging to a file, in addition to console output handled by Rich.
+    setup_logging()
     logger.info("Application started.")
     try:
         main()
-    except Exception as e:
-        # Catch any unhandled exceptions from main and log them
-        logger.critical(f"Unhandled exception in main: {e}", exc_info=True)
+    except KeyboardInterrupt:
+        logger.info("Application interrupted by user (KeyboardInterrupt).")
         console = Console()
-        console.print(f"[bold red]An critical error occurred: {e}[/bold red]")
+        console.print("[bold yellow]Interrupted by user. Exiting.[/bold yellow]")
+    except Exception as e:
+        # Catch any unhandled exceptions from main, log them with traceback and display friendly message.
+        logger.critical("Unhandled exception in main: %s", e, exc_info=True)
+        console = Console()
+        console.print(f"[bold red]A critical error occurred: {e}[/bold red]")
         console.print("Please check the log file (music_ripper.log) for more details.")
-    logger.info("Application finished.") 
+    logger.info("Application finished.")
