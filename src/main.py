@@ -57,7 +57,7 @@ def display_summary(console: Console, downloaded_songs: list, failed_songs: list
 
 def main():
     """Main function to parse arguments and start the download process."""
-    parser = argparse.ArgumentParser(description=Text("Spotify Playlist Downloader", style="bold green"))
+    parser = argparse.ArgumentParser(description="Spotify Playlist Downloader")
     parser.add_argument("playlist_url", help="The URL of the Spotify playlist to download.")
     parser.add_argument(
         "download_folder", 
