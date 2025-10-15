@@ -60,7 +60,8 @@ class SpotifyDownloader:
                     track_number = track.get('track_number')
                     release_date = album_info.get('release_date')
                     year = release_date.split('-')[0] if release_date else None
-                    cover_art_url = images[0].get('url') if (images := album_info.get('images', [])) else None
+                    images = album_info.get('images', [])
+                    cover_art_url = images[0].get('url') if images and len(images) > 0 else None
 
                     track_list.append({
                         "name": track_name, "artist": artists, "duration_ms": duration_ms,
@@ -327,9 +328,9 @@ class SpotifyDownloader:
 
 # Example usage (for testing this module directly):
 if __name__ == "__main__":
+    from dotenv import load_dotenv
     print("Testing SpotifyDownloader with iterative source attempts...")
     load_dotenv_path = os.path.join(os.path.dirname(__file__), "..", ".env")
-    from dotenv import load_dotenv
     if os.path.exists(load_dotenv_path):
         load_dotenv(dotenv_path=load_dotenv_path)
         print(f"Loaded .env file from: {load_dotenv_path}")
