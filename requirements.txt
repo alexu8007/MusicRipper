@@ -1,7 +1,11 @@
-Pillow==11.2.1
+Pillow==12.3.0
 pydub==0.25.1
-python-dotenv==1.1.0
-Requests==2.32.3
-rich==14.0.0
-spotipy==2.25.1
-yt_dlp==2025.4.30
+# pydub imports the stdlib "audioop" module, which was removed in Python 3.13.
+audioop-lts==0.2.2; python_version >= "3.13"
+python-dotenv==1.2.3
+requests==2.34.2
+rich==15.0.0
+spotipy==2.26.0
+# The [default] extra pulls in yt-dlp-ejs, which YouTube extraction needs
+# (together with a JavaScript runtime such as Deno, see README).
+yt-dlp[default]==2026.8.19

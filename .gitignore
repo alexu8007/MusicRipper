@@ -1,1 +1,4 @@
 *.env
+# Spotify login tokens. spotipy writes .cache by default; Music Ripper uses .spotify_token_cache.
+.spotify_token_cache
+.cache

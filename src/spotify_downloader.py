@@ -2,362 +2,479 @@
 """Handles Spotify API interaction and song downloading/processing orchestration."""
 
 import os
+import re
 import logging
 import json # For saving metadata
 import tempfile # For temporary cover art
 import shutil # For cleaning up temp_download_folder if it has contents
+from dataclasses import dataclass, field
+
 import requests # For downloading cover art
 import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
+from spotipy.cache_handler import CacheFileHandler
+from spotipy.oauth2 import SpotifyOAuth, SpotifyOauthError
 import yt_dlp
 
-from .config import SPOTIPY_CLIENT_ID, SPOTIPY_CLIENT_SECRET, DEFAULT_DOWNLOAD_DIR, DEFAULT_AUDIO_FORMAT
-from .utils import sanitize_filename, ensure_dir_exists
-from .audio_processor import convert_to_mp3_320kbps, validate_mp3_320kbps
+from .config import (
+    SPOTIPY_CLIENT_ID, SPOTIPY_CLIENT_SECRET, SPOTIPY_REDIRECT_URI, SPOTIFY_SCOPES, SPOTIFY_TOKEN_CACHE,
+    DEFAULT_DOWNLOAD_DIR, DEFAULT_AUDIO_FORMAT, MIN_SOURCE_BITRATE_KBPS,
+    YTDLP_COOKIES_FROM_BROWSER, YTDLP_COOKIES_FILE,
+)
+from .utils import sanitize_filename, ensure_dir_exists, describe_ytdlp_error, format_duration
+from .audio_processor import (
+    FFMPEG_TOOLS, DEFAULT_DURATION_TOLERANCE_MS, AudioProcessingError,
+    choose_output_bitrate_kbps, convert_to_mp3, describe_quality, probe_audio, validate_mp3,
+)
+from .external_tools import find_js_runtimes
 
 logger = logging.getLogger(__name__)
 
 # How many search results to check per source (SoundCloud, YouTube)
 MAX_SEARCH_RESULTS_PER_SOURCE = 3
-MIN_DURATION_PREFILTER_SECONDS = 45 # Pre-filter: skip if source reports duration less than this
-MIN_AUDIO_BITRATE_KBPS = 128      # Pre-filter: skip if source audio bitrate is less than this
+SOURCES = (("SoundCloud", "scsearch"), ("YouTube", "ytsearch"))
+
+_LINK_PREFIX = r"(?:spotify:|(?:https?://)?open\.spotify\.com/(?:intl-[A-Za-z-]+/)?)"
+_PLAYLIST_LINK_RE = re.compile(_LINK_PREFIX + r"(?:user[:/][^:/]+[:/])?playlist[:/]([0-9A-Za-z]+)")
+_OTHER_LINK_RE = re.compile(_LINK_PREFIX + r"(track|album|artist|show|episode|audiobook)[:/]")
+_SPOTIFY_ID_RE = re.compile(r"[0-9A-Za-z]{22}")
+
+
+class PlaylistFetchError(Exception):
+    """The playlist couldn't be read; the message explains why and how to fix it."""
+
+
+class CandidateRejected(Exception):
+    """A search result was skipped or failed to download/convert; the message says why."""
+
+
+@dataclass
+class DownloadResult:
+    path: str | None = None
+    source: str | None = None
+    quality: str | None = None  # e.g. "MP3 128 kbps (source: mp3 ~128 kbps)"
+    failures: list[str] = field(default_factory=list)  # why each source / search result didn't work
+    warnings: list[str] = field(default_factory=list)  # non-fatal problems, e.g. missing cover art
+
+
+def parse_playlist_id(link: str) -> str:
+    """Accepts open.spotify.com playlist URLs, spotify:playlist: URIs and bare IDs."""
+    link = link.strip()
+    if match := _PLAYLIST_LINK_RE.search(link):
+        return match.group(1)
+    if _SPOTIFY_ID_RE.fullmatch(link):
+        return link
+    if match := _OTHER_LINK_RE.search(link):
+        raise PlaylistFetchError(f"That is a Spotify {match.group(1)} link; only playlist links are supported.")
+    raise PlaylistFetchError(
+        f"'{link}' is not a Spotify playlist link. Expected something like "
+        "https://open.spotify.com/playlist/<id> or spotify:playlist:<id> (short spotify.link URLs "
+        "must be opened in a browser first to get the full link).")
+
+
+def explain_spotify_error(error: spotipy.SpotifyException) -> str:
+    status = error.http_status
+    # spotipy prefixes the message with the request URL; the last line is Spotify's reason.
+    detail = str(error.msg).strip().splitlines()[-1].strip() if error.msg else ""
+    reason = f"HTTP {status}" + (f": {detail}" if detail else "")
+    if status == 401:
+        return (f"Spotify rejected the login ({reason}). Delete the saved login at {SPOTIFY_TOKEN_CACHE} "
+                "and run again to log in fresh.")
+    if status == 403:
+        return (f"Spotify refused access to this playlist ({reason}). Since Spotify's February 2026 API "
+                "changes, apps in Development Mode can only read playlists that the logged-in account owns "
+                "or collaborates on. To download someone else's playlist, open it in Spotify, choose "
+                "'...' > 'Add to other playlist' > 'New playlist', and use the new playlist's link. Also make "
+                "sure the Spotify account that created the app has Premium, and, if you didn't create the "
+                "app yourself, that your account is added under 'User Management' in the app's dashboard.")
+    if status == 404:
+        return (f"Spotify couldn't find this playlist ({reason}). Check the link. Playlists made by Spotify "
+                "itself (editorial and 'Made For You' mixes, whose IDs start with 37i9dQZF) aren't available "
+                "to third-party apps; copy their songs into a playlist of your own instead.")
+    if status == 429:
+        return f"Spotify is rate-limiting requests ({reason}). Wait a few minutes and try again."
+    return f"Spotify API error ({reason})."
+
+
+def explain_oauth_error(error: SpotifyOauthError) -> str:
+    code = getattr(error, "error", None)
+    description = getattr(error, "error_description", None) or str(error)
+    if code == "invalid_client":
+        return (f"Spotify rejected the app credentials ({description}). Check SPOTIPY_CLIENT_ID and "
+                "SPOTIPY_CLIENT_SECRET in .env against your app in the Spotify Developer Dashboard.")
+    if code == "invalid_grant":
+        return (f"Spotify rejected the saved login ({description}). This happens when access was revoked or "
+                f"the redirect URI changed. Delete {SPOTIFY_TOKEN_CACHE} and run again to log in.")
+    if code == "access_denied":
+        return "The Spotify login was cancelled. Run again and click 'Agree' so Music Ripper can read your playlists."
+    return (f"Spotify login failed ({description}). Make sure SPOTIPY_REDIRECT_URI ({SPOTIPY_REDIRECT_URI}) "
+            "exactly matches a Redirect URI in your app's settings on the Spotify Developer Dashboard.")
+
+
+def _codec_name(acodec: str | None) -> str | None:
+    if not acodec or acodec == "none":
+        return None
+    return "aac" if acodec.startswith("mp4a") else acodec
+
 
 class SpotifyDownloader:
-    def __init__(self, client_id: str = None, client_secret: str = None):
+    def __init__(self, client_id: str = None, client_secret: str = None, redirect_uri: str = None,
+                 open_browser: bool = True):
         self.client_id = client_id or SPOTIPY_CLIENT_ID
         self.client_secret = client_secret or SPOTIPY_CLIENT_SECRET
+        self.redirect_uri = redirect_uri or SPOTIPY_REDIRECT_URI
 
         if not self.client_id or not self.client_secret:
             logger.error("Spotify API client ID or secret not configured.")
             raise ValueError("Spotify API client ID or secret not configured.")
 
+        # Reading playlist items requires a user login (Authorization Code flow); the
+        # app-only Client Credentials flow now gets "401 Valid user authentication required".
+        self.auth_manager = SpotifyOAuth(
+            client_id=self.client_id,
+            client_secret=self.client_secret,
+            redirect_uri=self.redirect_uri,
+            scope=SPOTIFY_SCOPES,
+            cache_handler=CacheFileHandler(cache_path=SPOTIFY_TOKEN_CACHE),
+            open_browser=open_browser,
+        )
+        self.sp = spotipy.Spotify(auth_manager=self.auth_manager)
+        self.js_runtimes = find_js_runtimes()
+        logger.info("Spotify client initialized successfully.")
+
+    def has_cached_login(self) -> bool:
+        """True if a saved Spotify login can be used without opening the browser."""
         try:
-            auth_manager = SpotifyClientCredentials(client_id=self.client_id, client_secret=self.client_secret)
-            self.sp = spotipy.Spotify(auth_manager=auth_manager)
-            logger.info("Spotify client initialized successfully.")
-        except Exception as e:
-            logger.error(f"Error initializing Spotify client: {e}")
-            raise
+            cached = self.auth_manager.cache_handler.get_cached_token()
+            return self.auth_manager.validate_token(cached) is not None
+        except (SpotifyOauthError, spotipy.SpotifyException, requests.exceptions.RequestException):
+            return False
 
     def get_playlist_tracks(self, playlist_url: str) -> list[dict]:
-        track_list = []
+        """Returns the playlist's tracks; raises PlaylistFetchError with an explanation on failure."""
+        playlist_id = parse_playlist_id(playlist_url)
         try:
-            playlist_id = playlist_url.split("/")[-1].split("?")[0]
-            results = self.sp.playlist_items(playlist_id)
+            # spotipy >= 2.26 uses GET /playlists/{id}/items (the old /tracks endpoint was removed).
+            results = self.sp.playlist_items(playlist_id, additional_types=("track",))
             items = results['items']
             while results['next']:
                 results = self.sp.next(results)
                 items.extend(results['items'])
-            
-            for item in items:
-                track = item.get('track')
-                if track and track.get('name') and track.get('artists') and track.get('duration_ms'):
-                    track_name = track['name']
-                    artists = ", ".join([artist['name'] for artist in track['artists']])
-                    duration_ms = track['duration_ms']
-                    album_info = track.get('album', {})
-                    album_name = album_info.get('name')
-                    track_number = track.get('track_number')
-                    release_date = album_info.get('release_date')
-                    year = release_date.split('-')[0] if release_date else None
-                    cover_art_url = images[0].get('url') if (images := album_info.get('images', [])) else None
-
-                    track_list.append({
-                        "name": track_name, "artist": artists, "duration_ms": duration_ms,
-                        "album": album_name, "track_number": str(track_number) if track_number else None,
-                        "year": year, "cover_art_url": cover_art_url,
-                        "spotify_track_id": track.get('id') # Store Spotify ID for reference
-                    })
-            logger.info(f"Fetched {len(track_list)} tracks with extended metadata from: {playlist_url}")
-        except Exception as e:
+        except SpotifyOauthError as e:
+            logger.error(f"Spotify login failed: {e}")
+            raise PlaylistFetchError(explain_oauth_error(e)) from e
+        except spotipy.SpotifyException as e:
             logger.error(f"Error fetching playlist tracks from {playlist_url}: {e}")
+            raise PlaylistFetchError(explain_spotify_error(e)) from e
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error fetching playlist tracks from {playlist_url}: {e}")
+            raise PlaylistFetchError(f"Could not reach Spotify ({e}). Check your internet connection.") from e
+
+        track_list = []
+        for item in items:
+            # Spotify renamed "track" to "item" in February 2026; "track" is deprecated.
+            track = (item or {}).get('item') or (item or {}).get('track')
+            if track and track.get('name') and track.get('artists') and track.get('duration_ms'):
+                track_name = track['name']
+                artists = ", ".join([artist['name'] for artist in track['artists']])
+                duration_ms = track['duration_ms']
+                album_info = track.get('album', {})
+                album_name = album_info.get('name')
+                track_number = track.get('track_number')
+                release_date = album_info.get('release_date')
+                year = release_date.split('-')[0] if release_date else None
+                cover_art_url = images[0].get('url') if (images := album_info.get('images', [])) else None
+
+                track_list.append({
+                    "name": track_name, "artist": artists, "duration_ms": duration_ms,
+                    "album": album_name, "track_number": str(track_number) if track_number else None,
+                    "year": year, "cover_art_url": cover_art_url,
+                    "spotify_track_id": track.get('id') # Store Spotify ID for reference
+                })
+        logger.info(f"Fetched {len(track_list)} tracks with extended metadata from: {playlist_url}")
         return track_list
 
-    def _execute_download_attempt(self, track_info: dict, search_prefix_n: str, source_name: str, attempt_temp_folder: str) -> str | None:
-        """
-        Attempts to download a single song from N search results from a given source.
-        Returns path to the raw downloaded audio file on first success, else None.
-        """
-        original_artist = track_info['artist']
-        original_name = track_info['name']
-        album_name = track_info.get('album')
-
-        query_parts = [original_artist, original_name]
-        if album_name:
-            query_parts.append(album_name)
-        query_parts.append("Audio") # Consistently add "Audio" at the end
-        search_query_base = " ".join(part for part in query_parts if part and part.strip()) # Join non-empty, non-whitespace-only parts
-        
-        sanitized_track_name = sanitize_filename(f"{original_name} {original_artist}")
-        ensure_dir_exists(attempt_temp_folder) # For individual raw downloads
-
-        logger.info(f"Searching top {MAX_SEARCH_RESULTS_PER_SOURCE} results on {source_name} for: {search_query_base}")
-        
-        ydl_opts_meta = {
-            'quiet': True, 
-            'noplaylist': True, 
-            'default_search': search_prefix_n, # e.g. scsearch3, ytsearch3
+    def _ydl_options(self, **extra) -> dict:
+        opts = {
+            'quiet': True,
+            'noprogress': True,
+            'noplaylist': True,
             'logger': logger,
-            # 'match_filter': f'duration > {MIN_DURATION_PREFILTER_SECONDS}' # This applies to search query itself, might be too broad.
-                                                                          # Better to filter after getting entries.
+        }
+        if self.js_runtimes: # yt-dlp only enables Deno by default; allow whatever is installed
+            opts['js_runtimes'] = self.js_runtimes
+        if FFMPEG_TOOLS.ffmpeg:
+            opts['ffmpeg_location'] = os.path.dirname(FFMPEG_TOOLS.ffmpeg)
+        if YTDLP_COOKIES_FILE:
+            opts['cookiefile'] = YTDLP_COOKIES_FILE
+        elif YTDLP_COOKIES_FROM_BROWSER:
+            browser, _, profile = YTDLP_COOKIES_FROM_BROWSER.partition(":")
+            opts['cookiesfrombrowser'] = (browser.strip().lower(), profile.strip() or None)
+        opts.update(extra)
+        return opts
+
+    def _search(self, search_prefix: str, query: str) -> list[dict]:
+        """Lists the top search results; raises yt_dlp.utils.DownloadError if the search fails."""
+        # extract_flat lists results without resolving each one, so a single
+        # unavailable video can't abort the whole search.
+        with yt_dlp.YoutubeDL(self._ydl_options(extract_flat='in_playlist')) as ydl:
+            results = ydl.extract_info(f"{search_prefix}{MAX_SEARCH_RESULTS_PER_SOURCE}:{query}", download=False)
+        entries = [entry for entry in (results or {}).get('entries') or [] if entry]
+        return entries[:MAX_SEARCH_RESULTS_PER_SOURCE]
+
+    def _download_candidate(self, entry: dict, track_info: dict, output_template: str) -> tuple[str, str, float | None, str | None]:
+        """
+        Pre-filters one search result and downloads its best audio stream.
+        Returns (raw file path, source URL, source bitrate in kbps, source codec).
+        Raises CandidateRejected explaining why the result can't be used.
+        """
+        entry_url = entry.get('webpage_url') or entry.get('url')
+        if not entry_url:
+            raise CandidateRejected("search result has no URL")
+
+        expected_ms = track_info.get('duration_ms')
+        entry_duration_sec = entry.get('duration') # Duration in seconds from yt-dlp
+        if expected_ms and entry_duration_sec is not None and \
+                abs(entry_duration_sec * 1000 - expected_ms) > DEFAULT_DURATION_TOLERANCE_MS:
+            raise CandidateRejected(
+                f"length {format_duration(entry_duration_sec * 1000)} doesn't match Spotify's "
+                f"{format_duration(expected_ms)} (likely a different version, a preview or a mix)")
+
+        ydl_opts = self._ydl_options(
+            format='bestaudio/best',
+            # Rank audio by bitrate first; otherwise yt-dlp prefers Opus, e.g. picking
+            # SoundCloud's 64 kbps Opus stream over its 128 kbps MP3 stream.
+            format_sort=['abr'],
+            outtmpl=output_template,
+        )
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            try:
+                info = ydl.extract_info(entry_url, download=False)
+            except yt_dlp.utils.DownloadError as e:
+                raise CandidateRejected(f"could not load track details: {describe_ytdlp_error(e)}") from e
+
+            if 'preview' in str(info.get('format_id') or '').lower():
+                raise CandidateRejected("only a 30-second preview is available (SoundCloud Go+ track)")
+            source_kbps = info.get('abr')
+            if source_kbps is None and info.get('vcodec') in (None, 'none'): # audio only: total bitrate is the audio bitrate
+                source_kbps = info.get('tbr')
+            if source_kbps is not None and source_kbps < MIN_SOURCE_BITRATE_KBPS:
+                raise CandidateRejected(
+                    f"best available audio is only {source_kbps:.0f} kbps (minimum is {MIN_SOURCE_BITRATE_KBPS} kbps)")
+
+            logger.info(f"Downloading '{info.get('title')}' ({entry_url}), format {info.get('format_id')}, "
+                        f"reported bitrate {source_kbps} kbps")
+            try:
+                info = ydl.process_ie_result(info, download=True)
+            except yt_dlp.utils.DownloadError as e:
+                raise CandidateRejected(f"download failed: {describe_ytdlp_error(e)}") from e
+
+            downloads = info.get('requested_downloads') or [{}]
+            raw_path = downloads[0].get('filepath') or ydl.prepare_filename(info)
+
+        if not raw_path or not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
+            raise CandidateRejected("download finished but no audio file was written")
+        return raw_path, entry_url, source_kbps, _codec_name(info.get('acodec'))
+
+    def _process_candidate(self, entry: dict, track_info: dict, work_dir: str, attempt_name: str,
+                           final_mp3_path: str, source_name: str, cover_image_path: str | None) -> dict:
+        """Downloads, converts and validates one search result. Returns quality metadata."""
+        raw_path, source_url, source_kbps, source_codec = self._download_candidate(
+            entry, track_info, os.path.join(work_dir, f"{attempt_name}.%(ext)s"))
+
+        if not source_kbps: # the site didn't report it; measure the downloaded file instead
+            try:
+                probed = probe_audio(raw_path)
+                source_kbps, source_codec = probed.bitrate_kbps, source_codec or probed.codec
+            except AudioProcessingError as e:
+                logger.warning(f"Could not measure source bitrate of {raw_path}: {e}")
+            if source_kbps and source_kbps < MIN_SOURCE_BITRATE_KBPS:
+                raise CandidateRejected(
+                    f"downloaded audio is only {source_kbps:.0f} kbps (minimum is {MIN_SOURCE_BITRATE_KBPS} kbps)")
+
+        output_kbps = choose_output_bitrate_kbps(source_kbps)
+        quality = describe_quality(output_kbps, source_kbps, source_codec)
+        try:
+            convert_to_mp3(
+                raw_path, final_mp3_path, output_kbps,
+                artist=track_info['artist'], title=track_info['name'],
+                album=track_info.get('album'), track_number=track_info.get('track_number'),
+                year=track_info.get('year'), cover_image_path=cover_image_path,
+                comment=f"Source: {source_name} {source_url} - {quality}",
+            )
+            validate_mp3(final_mp3_path, expected_bitrate_kbps=output_kbps,
+                         expected_duration_ms=track_info.get('duration_ms'))
+        except AudioProcessingError as e:
+            if os.path.exists(final_mp3_path): # Clean up failed MP3 conversion
+                try: os.remove(final_mp3_path)
+                except OSError: logger.error(f"Could not remove failed MP3 {final_mp3_path}")
+            raise CandidateRejected(str(e)) from e
+
+        return {
+            "download_source": source_name,
+            "source_url": source_url,
+            "source_codec": source_codec,
+            "source_bitrate_kbps": round(source_kbps) if source_kbps else None,
+            "output_bitrate_kbps": output_kbps,
+            "quality": quality,
         }
 
-        search_entries = []
+    def _reuse_existing(self, final_mp3_path: str, metadata_json_path: str, track_info: dict) -> DownloadResult | None:
+        logger.info(f"'{final_mp3_path}' already exists. Validating...")
         try:
-            with yt_dlp.YoutubeDL(ydl_opts_meta) as ydl_meta:
-                # extract_info with a search query and download=False should give us a list of entries
-                meta_results = ydl_meta.extract_info(search_query_base, download=False)
-                if meta_results and 'entries' in meta_results:
-                    search_entries = meta_results['entries']
-                elif meta_results and meta_results.get('webpage_url'): # Single result from search (e.g. if scsearch1 was used)
-                    search_entries = [meta_results] # Treat as a list with one entry
-
-        except yt_dlp.utils.DownloadError as de_meta:
-            logger.warning(f"Could not fetch search results from {source_name} for '{search_query_base}': {de_meta}")
-            return None
-        except Exception as e_meta:
-            logger.error(f"Unexpected error fetching search results from {source_name} for '{search_query_base}': {e_meta}")
+            validate_mp3(final_mp3_path, expected_duration_ms=track_info.get('duration_ms'))
+        except AudioProcessingError as e:
+            logger.warning(f"Existing file '{final_mp3_path}' is invalid ({e}). Re-downloading.")
             return None
 
-        if not search_entries:
-            logger.info(f"No search results found on {source_name} for: {search_query_base}")
-            return None
-
-        for i, entry in enumerate(search_entries):
-            if i >= MAX_SEARCH_RESULTS_PER_SOURCE: # Should be redundant if search_prefix_n works as expected
-                break
-
-            entry_title = entry.get('title', 'Unknown Title')
-            entry_url = entry.get('webpage_url') or entry.get('url')
-            entry_duration_sec = entry.get('duration') # Duration in seconds from yt-dlp
-
-            logger.info(f"Considering {source_name} search result {i+1}/{len(search_entries)}: '{entry_title}' (duration: {entry_duration_sec}s)")
-
-            if not entry_url:
-                logger.warning(f"Skipping search result {i+1} from {source_name} (no URL found).")
-                continue
-
-            if entry_duration_sec is not None and entry_duration_sec < MIN_DURATION_PREFILTER_SECONDS:
-                logger.info(f"Skipping search result {i+1} from {source_name} ('{entry_title}') due to short duration ({entry_duration_sec}s < {MIN_DURATION_PREFILTER_SECONDS}s)." )
-                continue
-            
-            # Pre-filter by audio bitrate before attempting full download of this specific entry
+        logger.info(f"Existing file '{final_mp3_path}' is valid. Skipping download.")
+        existing_meta = {}
+        if os.path.exists(metadata_json_path):
             try:
-                logger.debug(f"Fetching detailed metadata for {source_name} entry: {entry_url} to check bitrate.")
-                ydl_opts_entry_specific_meta = {
-                    'quiet': True, 
-                    'logger': logger, 
-                    'format': 'bestaudio/best', # Ask yt-dlp to determine what it thinks is bestaudio
-                    # 'extract_flat': 'in_playlist', # Faster if we only need top-level meta like ABR
-                }
-                with yt_dlp.YoutubeDL(ydl_opts_entry_specific_meta) as ydl_esm:
-                    entry_specific_info = ydl_esm.extract_info(entry_url, download=False)
-                
-                selected_format_abr = entry_specific_info.get('abr') # abr for audio bitrate in kbps
-                # Some sources might provide tbr (total bitrate) instead of abr if it's audio only.
-                # Prefer abr if available.
-                if selected_format_abr is None and entry_specific_info.get('vcodec') == 'none': # If audio only, tbr might be abr
-                    selected_format_abr = entry_specific_info.get('tbr')
+                with open(metadata_json_path, 'r', encoding='utf-8') as f_json_read:
+                    existing_meta = json.load(f_json_read)
+            except (OSError, ValueError) as e:
+                logger.warning(f"Could not read {metadata_json_path}: {e}")
+        return DownloadResult(
+            path=final_mp3_path,
+            source=existing_meta.get('download_source', "Unknown/Existing"),
+            quality=existing_meta.get('quality', "existing file (source quality unknown)"),
+        )
 
-                logger.debug(f"Reported ABR/TBR for {entry_url}: {selected_format_abr} kbps")
+    def _download_cover_art(self, track_info: dict, folder: str, result: DownloadResult) -> str | None:
+        cover_art_url = track_info.get('cover_art_url')
+        if not cover_art_url:
+            return None
+        try:
+            response = requests.get(cover_art_url, stream=True, timeout=10)
+            response.raise_for_status()
+            # Spotify serves JPEGs without a file extension; pydub needs one to embed the cover.
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg", dir=folder, prefix="cover_") as tmp_cover:
+                for chunk in response.iter_content(chunk_size=8192):
+                    tmp_cover.write(chunk)
+            logger.info(f"Downloaded cover art to: {tmp_cover.name}")
+            return tmp_cover.name
+        except (requests.exceptions.RequestException, OSError) as e_cover:
+            message = f"cover art could not be downloaded ({e_cover}); saved without it"
+            logger.warning(f"{track_info['artist']} - {track_info['name']}: {message}")
+            result.warnings.append(message)
+            return None
 
-                if selected_format_abr is not None and selected_format_abr < MIN_AUDIO_BITRATE_KBPS:
-                    logger.info(f"Skipping search result {i+1} from {source_name} ('{entry_title}') due to low source bitrate ({selected_format_abr}kbps < {MIN_AUDIO_BITRATE_KBPS}kbps).")
-                    continue
-                elif selected_format_abr is None:
-                    logger.warning(f"Could not determine audio bitrate for {source_name} entry '{entry_title}' ({entry_url}). Proceeding with download attempt.")
-            except yt_dlp.utils.DownloadError as de_esm:
-                logger.warning(f"Could not fetch specific metadata for bitrate check of {source_name} entry '{entry_title}' ({entry_url}): {de_esm}. Skipping this entry.")
-                continue
-            except Exception as e_esm:
-                logger.error(f"Unexpected error fetching specific metadata for bitrate check of {source_name} entry '{entry_title}' ({entry_url}): {e_esm}. Skipping this entry.")
-                continue
-            
-            # Path for this specific attempt's raw download
-            # Use a unique name for each attempt to avoid overwriting within the attempt_temp_folder
-            temp_output_template_entry = os.path.join(attempt_temp_folder, f"{sanitized_track_name}_attempt_{i+1}.%(ext)s")
+    def download_song(self, track_info: dict, download_dir: str) -> DownloadResult:
+        """Downloads one track, trying each source's search results in turn.
 
-            ydl_opts_download = {
-                'format': 'bestaudio/best',
-                'outtmpl': temp_output_template_entry,
-                'quiet': True,
-                'noplaylist': True, # Ensure we are downloading the specific entry
-                'logger': logger,
-                # No search, no match_filter here; we are downloading a specific URL
-            }
-            
-            temp_downloaded_actual_path = None
-            try:
-                logger.info(f"Attempting to download specific entry from {source_name}: '{entry_title}' ({entry_url})")
-                with yt_dlp.YoutubeDL(ydl_opts_download) as ydl_dl:
-                    # Download the specific entry URL
-                    download_info = ydl_dl.extract_info(entry_url, download=True)
-                    # The actual path is determined by outtmpl and the extension yt-dlp chooses
-                    temp_downloaded_actual_path = ydl_dl.prepare_filename(download_info)
-
-                if temp_downloaded_actual_path and os.path.exists(temp_downloaded_actual_path):
-                    logger.info(f"Successfully downloaded raw audio for entry {i+1} from {source_name} to {temp_downloaded_actual_path}")
-                    return temp_downloaded_actual_path # Return path to raw audio
-                else:
-                    logger.warning(f"Download of entry {i+1} from {source_name} ('{entry_title}') seemed to complete but file not found.")
-
-            except yt_dlp.utils.DownloadError as de_dl:
-                logger.warning(f"Failed to download entry {i+1} ('{entry_title}') from {source_name}: {de_dl}")
-            except Exception as e_dl:
-                logger.error(f"Unexpected error downloading entry {i+1} ('{entry_title}') from {source_name}: {e_dl}")
-            
-            # If download failed for this entry, loop to the next one
-
-        logger.info(f"All ({len(search_entries)}) search results from {source_name} for '{search_query_base}' failed pre-filter or download.")
-        return None # All entries failed
-
-    def download_song(self, track_info: dict, download_dir: str) -> tuple[str | None, str | None]:
+        On failure, DownloadResult.failures lists why every source and result was rejected.
+        """
         ensure_dir_exists(download_dir)
         original_artist = track_info['artist']
         original_name = track_info['name']
         sanitized_track_name = sanitize_filename(f"{original_artist} - {original_name}")
-        
+
         final_mp3_path = os.path.join(download_dir, f"{sanitized_track_name}.{DEFAULT_AUDIO_FORMAT}")
         metadata_json_path = os.path.join(download_dir, f"{sanitized_track_name}.json")
 
+        if os.path.exists(final_mp3_path):
+            existing = self._reuse_existing(final_mp3_path, metadata_json_path, track_info)
+            if existing:
+                return existing
+
         # Base temporary folder for this song, cleaned up at the end
-        song_specific_temp_base = os.path.join(download_dir, f"_temp_dl_{sanitize_filename(track_info.get('spotify_track_id', sanitized_track_name))}")
+        song_specific_temp_base = os.path.join(download_dir, f"_temp_dl_{sanitize_filename(track_info.get('spotify_track_id') or sanitized_track_name)}")
         if os.path.exists(song_specific_temp_base): # Clean if exists from a previous failed run for this song
             try: shutil.rmtree(song_specific_temp_base)
             except OSError: pass
         ensure_dir_exists(song_specific_temp_base)
 
-        temp_cover_image_path = None
-        final_validated_mp3_path = None
-        successful_source_name = None
+        result = DownloadResult()
+        query_parts = [original_artist, original_name]
+        if track_info.get('album'):
+            query_parts.append(track_info['album'])
+        query_parts.append("Audio") # Consistently add "Audio" at the end
+        search_query = " ".join(part for part in query_parts if part and part.strip())
 
-        if os.path.exists(final_mp3_path):
-            logger.info(f"'{final_mp3_path}' already exists. Validating...")
-            if validate_mp3_320kbps(final_mp3_path, expected_duration_ms=track_info.get('duration_ms')):
-                logger.info(f"Existing file '{final_mp3_path}' is valid. Skipping download.")
-                existing_source = "Unknown/Existing"
-                if os.path.exists(metadata_json_path):
+        try:
+            cover_image_path = self._download_cover_art(track_info, song_specific_temp_base, result)
+
+            for source_name, search_prefix in SOURCES:
+                logger.info(f"Searching top {MAX_SEARCH_RESULTS_PER_SOURCE} results on {source_name} for: {search_query}")
+                try:
+                    entries = self._search(search_prefix, search_query)
+                except yt_dlp.utils.DownloadError as e:
+                    result.failures.append(f"{source_name}: search failed: {describe_ytdlp_error(e)}")
+                    continue
+                if not entries:
+                    result.failures.append(f"{source_name}: no search results for \"{search_query}\"")
+                    continue
+
+                for index, entry in enumerate(entries, 1):
+                    label = f"{source_name} result {index} \"{entry.get('title') or 'untitled'}\""
                     try:
-                        with open(metadata_json_path, 'r', encoding='utf-8') as f_json_read:
-                            existing_meta = json.load(f_json_read)
-                            existing_source = existing_meta.get('download_source', existing_source)
-                    except Exception: pass
-                shutil.rmtree(song_specific_temp_base) # Clean up temp base if we skip
-                return final_mp3_path, existing_source
-            else:
-                logger.warning(f"Existing file '{final_mp3_path}' is invalid. Re-downloading.")
+                        quality_meta = self._process_candidate(
+                            entry, track_info, song_specific_temp_base,
+                            f"{sanitize_filename(source_name)}_{index}", final_mp3_path,
+                            source_name, cover_image_path)
+                    except CandidateRejected as e:
+                        logger.info(f"Rejected {label}: {e}")
+                        result.failures.append(f"{label}: {e}")
+                        continue
+                    except Exception as e: # unexpected; log it and keep trying other results
+                        logger.exception(f"Unexpected error processing {label}")
+                        result.failures.append(f"{label}: unexpected error: {type(e).__name__}: {e}")
+                        continue
 
-        cover_art_url = track_info.get('cover_art_url')
-        if cover_art_url:
-            try:
-                response = requests.get(cover_art_url, stream=True, timeout=10)
-                response.raise_for_status()
-                img_suffix = os.path.splitext(cover_art_url.split('?')[0])[-1] or '.jpg'
-                with tempfile.NamedTemporaryFile(delete=False, suffix=img_suffix, dir=song_specific_temp_base, prefix="cover_") as tmp_cover:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        tmp_cover.write(chunk)
-                    temp_cover_image_path = tmp_cover.name
-                logger.info(f"Downloaded cover art to: {temp_cover_image_path}")
-            except Exception as e_cover:
-                logger.warning(f"Failed to download cover art for {original_artist} - {original_name}: {e_cover}")
+                    logger.info(f"Successfully PROCESSED and VALIDATED from {source_name}: {final_mp3_path} ({quality_meta['quality']})")
+                    result.path, result.source, result.quality = final_mp3_path, source_name, quality_meta['quality']
+                    try:
+                        with open(metadata_json_path, 'w', encoding='utf-8') as f_json:
+                            json.dump({**track_info, **quality_meta}, f_json, ensure_ascii=False, indent=4)
+                        logger.info(f"Saved metadata to: {metadata_json_path}")
+                    except OSError as e_json:
+                        logger.error(f"Failed to save metadata JSON for {final_mp3_path}: {e_json}")
+                    return result
+        finally:
+            # After trying all sources, clean up the main temporary base folder for this song
+            if os.path.exists(song_specific_temp_base):
+                try:
+                    shutil.rmtree(song_specific_temp_base)
+                    logger.info(f"Cleaned up base temporary folder for song: {song_specific_temp_base}")
+                except OSError as e_os:
+                    logger.error(f"Error deleting base temporary folder {song_specific_temp_base}: {e_os}")
 
-        sources_to_try = [
-            ("SoundCloud", f"scsearch{MAX_SEARCH_RESULTS_PER_SOURCE}"),
-            ("YouTube",    f"ytsearch{MAX_SEARCH_RESULTS_PER_SOURCE}")
-        ]
-
-        for source_name, search_prefix_n in sources_to_try:
-            logger.info(f"Attempting source: {source_name} for '{original_artist} - {original_name}'")
-            # Create a subfolder within song_specific_temp_base for this source's raw downloads
-            source_attempt_temp_folder = os.path.join(song_specific_temp_base, sanitize_filename(source_name) + "_raw_downloads")
-            
-            raw_audio_path_from_source = self._execute_download_attempt(
-                track_info, search_prefix_n, source_name, source_attempt_temp_folder
-            )
-
-            if raw_audio_path_from_source and os.path.exists(raw_audio_path_from_source):
-                logger.info(f"Raw audio obtained from {source_name}: {raw_audio_path_from_source}. Converting and validating.")
-                if convert_to_mp3_320kbps(
-                    raw_audio_path_from_source, final_mp3_path, 
-                    artist=original_artist, title=original_name,
-                    album=track_info.get('album'), track_number=track_info.get('track_number'),
-                    year=track_info.get('year'), cover_image_path=temp_cover_image_path
-                ):
-                    if validate_mp3_320kbps(final_mp3_path, expected_duration_ms=track_info.get('duration_ms')):
-                        logger.info(f"Successfully PROCESSED and VALIDATED from {source_name}: {final_mp3_path}")
-                        final_validated_mp3_path = final_mp3_path
-                        successful_source_name = source_name
-                        track_info['download_source'] = successful_source_name
-                        try:
-                            with open(metadata_json_path, 'w', encoding='utf-8') as f_json:
-                                json.dump(track_info, f_json, ensure_ascii=False, indent=4)
-                            logger.info(f"Saved metadata to: {metadata_json_path}")
-                        except Exception as e_json:
-                            logger.error(f"Failed to save metadata JSON for {final_mp3_path}: {e_json}")
-                        break # Success, stop trying other sources
-                    else:
-                        logger.warning(f"Validation FAILED for {final_mp3_path} (from {source_name}). Will try next source if available.")
-                        if os.path.exists(final_mp3_path): # Clean up failed MP3 conversion
-                            try: os.remove(final_mp3_path)
-                            except OSError: logger.error(f"Could not remove failed MP3 {final_mp3_path}")
-                else:
-                    logger.warning(f"Conversion to MP3 FAILED for raw audio from {source_name} ({raw_audio_path_from_source}). Will try next source if available.")
-                # Raw audio from this source attempt is no longer needed or failed processing
-                # shutil.rmtree(source_attempt_temp_folder) # Clean up specific raw download folder for this source is too aggressive here, base folder cleaned at end
-            else:
-                logger.info(f"No suitable raw audio obtained from {source_name} for '{original_artist} - {original_name}'.")
-        
-        # After trying all sources, clean up the main temporary base folder for this song
-        if os.path.exists(song_specific_temp_base):
-            try:
-                shutil.rmtree(song_specific_temp_base)
-                logger.info(f"Cleaned up base temporary folder for song: {song_specific_temp_base}")
-            except OSError as e_os:
-                logger.error(f"Error deleting base temporary folder {song_specific_temp_base}: {e_os}")
-        
-        if not final_validated_mp3_path:
-            logger.error(f"All download and processing attempts FAILED for: {original_artist} - {original_name}")
-            # Ensure a partially created (but failed validation) MP3 is removed if it still exists
-            if os.path.exists(final_mp3_path):
-                 logger.warning(f"Ensuring removal of incomplete/invalid output file: {final_mp3_path}")
-                 try: os.remove(final_mp3_path)
-                 except OSError: pass
-
-        return final_validated_mp3_path, successful_source_name
+        logger.error(f"All download and processing attempts FAILED for: {original_artist} - {original_name}")
+        for failure in result.failures:
+            logger.error(f"  - {failure}")
+        return result
 
 # Example usage (for testing this module directly):
 if __name__ == "__main__":
+    # Run from the project root with: python -m src.spotify_downloader
     print("Testing SpotifyDownloader with iterative source attempts...")
-    load_dotenv_path = os.path.join(os.path.dirname(__file__), "..", ".env")
-    from dotenv import load_dotenv
-    if os.path.exists(load_dotenv_path):
-        load_dotenv(dotenv_path=load_dotenv_path)
-        print(f"Loaded .env file from: {load_dotenv_path}")
-    else:
-        print(f".env file not found. Credentials must be set as env vars.")
 
     if not SPOTIPY_CLIENT_ID or not SPOTIPY_CLIENT_SECRET:
         print("Spotify API credentials not found. Skipping direct test.")
     else:
         downloader = SpotifyDownloader()
-        test_playlist_url = "https://open.spotify.com/playlist/37i9dQZF1DX0s5kDeEflF1" # Lo-fi beats
+        # Must be a playlist you own or collaborate on (see README).
+        test_playlist_url = os.getenv("TEST_PLAYLIST_URL", "")
         print(f"Fetching tracks from: {test_playlist_url}")
-        tracks = downloader.get_playlist_tracks(test_playlist_url)
-        
+        try:
+            tracks = downloader.get_playlist_tracks(test_playlist_url)
+        except PlaylistFetchError as e:
+            print(f"Could not fetch tracks for testing: {e}")
+            tracks = []
+
         if tracks:
-            test_download_folder = os.path.join(DEFAULT_DOWNLOAD_DIR, "SpotifyDownloaderTest_Iterative") 
+            test_download_folder = os.path.join(DEFAULT_DOWNLOAD_DIR, "SpotifyDownloaderTest_Iterative")
             ensure_dir_exists(test_download_folder)
             print(f"Test download folder: {test_download_folder}")
 
             # Test with the first 2 tracks from the playlist
-            for i, track_to_test in enumerate(tracks[:2]): 
+            for i, track_to_test in enumerate(tracks[:2]):
                 print(f"\n--- Downloading Test Track {i+1}: {track_to_test['artist']} - {track_to_test['name']} ---")
-                downloaded_path, source = downloader.download_song(track_to_test, test_download_folder)
-                if downloaded_path:
-                    print(f"SUCCESS: Test track {i+1} downloaded from {source} to: {downloaded_path}")
-                    if os.path.exists(downloaded_path):
-                        print(f"File size: {os.path.getsize(downloaded_path) / (1024*1024):.2f} MB")
+                outcome = downloader.download_song(track_to_test, test_download_folder)
+                if outcome.path:
+                    print(f"SUCCESS: Test track {i+1} downloaded from {outcome.source} to: {outcome.path} ({outcome.quality})")
+                    print(f"File size: {os.path.getsize(outcome.path) / (1024*1024):.2f} MB")
                 else:
-                    print(f"FAILED: Test track {i+1} download failed.")
-        else:
-            print("Could not fetch tracks for testing.") 
+                    print(f"FAILED: Test track {i+1} download failed:")
+                    for failure in outcome.failures:
+                        print(f"  - {failure}")
