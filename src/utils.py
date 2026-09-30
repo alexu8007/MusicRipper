@@ -28,7 +28,39 @@ def ensure_dir_exists(dir_path: str):
             logging.error(f"Error creating directory {dir_path}: {e}")
             raise
 
-# More utility functions will be added here, e.g.:
-# - validate_mp3_320kbps (using pydub)
-# - get_file_size
-# - etc. 
+def format_duration(milliseconds: float) -> str:
+    """12345 -> '0:12'."""
+    seconds = round(milliseconds / 1000)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+# (text in a yt-dlp error, what to do about it in this app)
+YTDLP_ERROR_HINTS = (
+    ("Sign in to confirm", "YouTube is asking for a signed-in session (bot check). Set "
+     "YTDLP_COOKIES_FROM_BROWSER=firefox (or chrome, edge, ...) in .env so yt-dlp can use your "
+     "browser's YouTube cookies."),
+    ("No suitable extractor", 'yt-dlp doesn\'t understand the site\'s current format. Update it: '
+     'pip install -U "yt-dlp[default]"'),
+    ("Requested format is not available", 'No downloadable audio stream was offered. Update yt-dlp '
+     '(pip install -U "yt-dlp[default]") and install Deno so YouTube formats can be unlocked.'),
+    ("HTTP Error 403", 'The site refused the download. Updating yt-dlp usually fixes this: '
+     'pip install -U "yt-dlp[default]"'),
+    ("HTTP Error 429", "The site is rate-limiting you. Wait a while, or set YTDLP_COOKIES_FROM_BROWSER in .env."),
+    ("ffmpeg not found", "See README, 'Install FFmpeg and FFprobe', or set FFMPEG_PATH in .env."),
+)
+
+
+def describe_ytdlp_error(error) -> str:
+    """Turns a yt-dlp exception into a one-line reason plus a hint on how to fix it."""
+    message = _ANSI_ESCAPE.sub("", str(error)).strip()
+    message = message.splitlines()[0] if message else type(error).__name__
+    message = re.sub(r"^ERROR:\s*", "", message)
+    # Drop yt-dlp's command-line advice (--cookies ..., see <url>); it doesn't apply to this app.
+    message = re.split(r"\s+(?:Use --|See\s+https?://|Please report this issue)", message,
+                       maxsplit=1, flags=re.IGNORECASE)[0].rstrip(" .;")
+    for needle, hint in YTDLP_ERROR_HINTS:
+        if needle.lower() in message.lower():
+            return f"{message}. {hint}"
+    return message
